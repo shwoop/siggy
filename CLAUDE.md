@@ -57,7 +57,7 @@ Never commit directly to master. Always follow this process:
 2. **Run checks** before pushing: `cargo clippy --tests -- -D warnings && cargo test`
 3. **Push** the branch to origin with `-u`
 4. **Create a PR** via `gh pr create` targeting master
-5. **Review** the PR, then merge once approved
+5. **Review** the PR diff, wait for CI to pass, then **squash merge** with `gh pr merge --squash --delete-branch`
 
 Master is force-push protected.
 
