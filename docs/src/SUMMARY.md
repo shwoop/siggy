@@ -13,6 +13,7 @@
 - [Commands](user-guide/commands.md)
 - [Keybindings](user-guide/keybindings.md)
 - [Features](user-guide/features.md)
+- [Security](user-guide/security.md)
 - [Troubleshooting](user-guide/troubleshooting.md)
 - [FAQ](user-guide/faq.md)
 

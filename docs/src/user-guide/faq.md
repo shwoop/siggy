@@ -14,14 +14,15 @@ links to your existing account as a secondary device.
 ## Is my data encrypted?
 
 Messages are end-to-end encrypted in transit by the Signal protocol (handled by
-signal-cli). Locally, messages are stored in a plain SQLite database. If you want
-zero local persistence, use `--incognito` mode.
+signal-cli). Locally, messages are stored in an unencrypted SQLite database --
+the same approach used by Signal Desktop. If you want zero local persistence,
+use `--incognito` mode. See the [Security](security.md) page for full details
+and recommendations.
 
 ## Can I send files and images?
 
-Currently, siggy can **receive** attachments (images are rendered inline,
-other files are saved to disk). **Sending** attachments is on the
-[roadmap](../dev-guide/roadmap.md).
+Yes. Use `/attach` to open a file browser and select a file to send. Received
+images are rendered inline, and other files are saved to your download directory.
 
 ## Does it work on Windows?
 
