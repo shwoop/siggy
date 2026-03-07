@@ -95,6 +95,8 @@ Reactions display below messages as compact badges:
 Enable "Verbose reactions" in `/settings` to show sender names instead of counts.
 Reactions sync across devices and persist in the database.
 
+![Reactions, quote reply, link preview, and poll](../reactions-quotereply-linkpreview-poll.png)
+
 ## @mentions
 
 In group chats, type `@` to open a member autocomplete popup. Filter by name and
@@ -102,6 +104,8 @@ press Tab to insert the mention. Works in 1:1 chats too (with the conversation
 partner). Incoming mentions are highlighted in cyan+bold.
 
 ## Visible message selection
+
+![Focused message](../focussed-message.png)
 
 When scrolling in Normal mode, the focused message gets a subtle dark background
 highlight. This makes it clear which message `r` (react) and `y`/`Y` (copy) will
@@ -290,6 +294,8 @@ The sidebar can be placed on the left (default) or right side of the screen.
 Toggle via `/settings` > "Sidebar on right".
 
 ## Configurable keybindings
+
+![Keybindings overlay](../keybinds-menu.png)
 
 All keybindings are fully configurable. Choose from three built-in profiles
 (Default, Emacs, Minimal) or create your own. Override individual keys via

@@ -30,6 +30,8 @@ All commands start with `/`. Type `/` in Insert mode to open the autocomplete po
 
 ## Autocomplete
 
+![Slash command autocomplete](../slash-command-menu.png)
+
 When you type `/`, a popup appears showing matching commands. As you continue
 typing, the list filters down. Use:
 

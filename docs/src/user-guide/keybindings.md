@@ -165,6 +165,13 @@ Mouse support is enabled by default (toggle in `/settings`).
 | Click in input bar | Position cursor |
 | Scroll wheel in overlays | Navigate list items |
 
+## Help overlay
+
+![Help overlay](../help-menu.png)
+
+Press `/help` (alias `/h`) to see all keybindings and commands at a glance.
+The help overlay dynamically reflects your active keybinding profile.
+
 ## Input history
 
 In Insert mode, press `Up` and `Down` to cycle through previously sent messages

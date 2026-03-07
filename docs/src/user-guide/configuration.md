@@ -71,6 +71,8 @@ CLI flags override config file values for the current session:
 
 ## Settings overlay
 
+![Settings overlay](../settings-menu.png)
+
 Press `/settings` inside the app to open the settings overlay. This provides
 toggles for runtime settings:
 
