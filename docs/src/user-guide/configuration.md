@@ -36,6 +36,7 @@ send_read_receipts = true
 mouse_enabled = true
 theme = "Default"
 keybinding_profile = "Default"
+proxy = ""
 ```
 
 ### Field reference
@@ -58,6 +59,7 @@ keybinding_profile = "Default"
 | `mouse_enabled` | bool | `true` | Enable mouse support (click sidebar, scroll, etc.) |
 | `theme` | string | `"Default"` | Color theme name |
 | `keybinding_profile` | string | `"Default"` | Keybinding profile (`Default`, `Emacs`, `Minimal`, or custom) |
+| `proxy` | string | `""` | Signal TLS proxy URL passed through to signal-cli |
 
 ## CLI flags
 

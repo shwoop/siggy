@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.3.2
+
+### Bug fixes
+
+- **Cursor blink fix** -- the event loop was redrawing every 50ms regardless of
+  state changes, resetting the terminal's cursor blink timer. Now frames are only
+  drawn when state actually changes (#177)
+
+### Enhancements
+
+- **Proxy config** -- added a `proxy` field to `config.toml` for Signal TLS
+  proxy URLs, passed through to signal-cli as `--proxy`. Useful for connecting
+  in censored regions (#178)
+
+### Developer
+
+- **Fuzz testing** -- added `cargo-fuzz` harnesses for JSON-RPC parsing, UTF-8
+  cursor operations, keybinding parsing, and slash command parsing (#179)
+
+---
+
+## v1.3.1
+
+### Bug fixes
+
+- **Image attachments** -- fixed image attachments not rendering after restart on
+  Unix (#175)
+- **Quit aliases** -- added `:q` and `:quit` as aliases for `/quit` (#174)
+
+---
+
 ## v1.3.0
 
 ### Bug fixes

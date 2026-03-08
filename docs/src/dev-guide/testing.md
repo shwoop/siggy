@@ -142,3 +142,23 @@ cargo clippy --tests -- -D warnings
 ```
 
 CI runs this on every push and pull request. Fix all warnings before pushing.
+
+## Fuzz testing
+
+The `fuzz/` directory contains [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz.html) harnesses for external input boundaries. Fuzz testing requires **nightly Rust** and **Linux or macOS** (libfuzzer does not support Windows).
+
+```sh
+cargo install cargo-fuzz
+cargo +nightly fuzz run <target>
+```
+
+### Fuzz targets
+
+| Target | What it tests |
+|---|---|
+| `fuzz_json_rpc` | JSON-RPC deserialization and `parse_signal_event` / `parse_rpc_result` |
+| `fuzz_input_edit` | UTF-8 cursor navigation and string mutation at byte boundaries |
+| `fuzz_key_combo` | `parse_key_combo` with arbitrary strings from user TOML files |
+| `fuzz_command_parse` | `parse_input` with arbitrary slash commands |
+
+Run `cargo fuzz list` to see all available targets. Any panic found by the fuzzer is a bug to fix.
