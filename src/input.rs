@@ -125,7 +125,7 @@ pub fn parse_input(input: &str) -> InputAction {
         "/block" => InputAction::Block,
         "/unblock" => InputAction::Unblock,
         "/attach" | "/a" => InputAction::Attach,
-        "/paste" | "/pa" => InputAction::Paste,
+        "/paste" | "/pa" => InputAction::Paste, // /p taken by /part, /pa is the initialism
         "/search" | "/s" => {
             if arg.is_empty() {
                 InputAction::Unknown("/search requires a query".to_string())

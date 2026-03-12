@@ -606,6 +606,12 @@ async fn dispatch_send(
                     app.status_message = format!("send error: {e}");
                 }
             }
+            // Clean up any temp paste files after signal-cli has read them
+            for path in &attachments {
+                if path.starts_with(&app.paste_temp_path) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
         }
         SendRequest::Reaction {
             conv_id, emoji, is_group, target_author, target_timestamp, remove,

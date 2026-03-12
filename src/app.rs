@@ -443,7 +443,7 @@ pub struct App {
     /// File selected for sending as attachment
     pub pending_attachment: Option<PathBuf>,
     /// Directory for temporary clipboard paste files (PID-scoped to avoid conflicts)
-    paste_temp_path: PathBuf,
+    pub paste_temp_path: PathBuf,
     /// Reply target: (author_phone, body_snippet, timestamp_ms)
     pub reply_target: Option<(String, String, i64)>,
     /// Delete confirmation overlay visible
@@ -2821,7 +2821,12 @@ impl App {
             pending_attachment: None,
             paste_temp_path: {
                 let dir = std::env::temp_dir().join(format!("siggy-paste-{}", std::process::id()));
-                let _ = std::fs::create_dir_all(&dir);
+                // Best-effort: clean any stale files from a previous run with the same PID,
+                // then recreate. Errors here are non-fatal; handle_clipboard_image re-checks.
+                let _ = std::fs::remove_dir_all(&dir);
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    crate::debug_log::logf(format_args!("paste temp dir init failed: {e}"));
+                }
                 dir
             },
             reply_target: None,
@@ -6074,6 +6079,8 @@ impl App {
     }
 
     /// Handle text content from clipboard: file path detection or plain text insert.
+    /// Insert clipboard text into the input buffer (trimmed). Returns early with a status message
+    /// if the text is empty. File paths are treated as plain text — use `/attach` to attach files.
     fn handle_paste_text(&mut self, text: &str) -> Option<SendRequest> {
         let text = text.trim();
         if text.is_empty() {
@@ -6118,6 +6125,10 @@ impl App {
     }
 
     /// Handle the `/paste` command: read clipboard and act on contents.
+    /// Image data → temp PNG → pending_attachment. Text → input buffer.
+    /// Note: the full clipboard-read path is not unit-tested because `arboard::Clipboard`
+    /// requires a display/compositor and cannot be mocked. The individual handlers
+    /// (`handle_clipboard_image`, `handle_paste_text`) are tested directly instead.
     fn handle_paste_command(&mut self) -> Option<SendRequest> {
         if self.active_conversation.is_none() {
             self.status_message = "No active conversation".to_string();
@@ -6137,7 +6148,7 @@ impl App {
             return self.handle_clipboard_image(img_data);
         }
 
-        // Try text (includes file path detection)
+        // Try text — inserts into input buffer
         if let Ok(text) = clipboard.get_text() {
             return self.handle_paste_text(&text);
         }
