@@ -6070,22 +6070,23 @@ impl App {
 
     /// Handle text content from clipboard: file path detection or plain text insert.
     fn handle_paste_text(&mut self, text: &str) -> Option<SendRequest> {
-        if text.trim().is_empty() {
+        let text = text.trim();
+        if text.is_empty() {
             self.status_message = "Clipboard is empty".to_string();
             return None;
         }
 
-        let path = PathBuf::from(text.trim());
+        let path = PathBuf::from(text);
         if path.is_absolute() && path.exists() && path.is_file() {
-            self.pending_attachment = Some(path.clone());
             let fname = path.file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| "file".to_string());
+            self.pending_attachment = Some(path);
             self.status_message = format!("Pasted file: {fname}");
             return None;
         }
 
-        self.handle_paste(text.trim().to_string())
+        self.handle_paste(text.to_string())
     }
 
     /// Save clipboard image data to a temp PNG file and stage it as an attachment.
@@ -6103,9 +6104,14 @@ impl App {
             }
         };
 
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S%.3f");
         let filename = format!("clipboard_{timestamp}.png");
         let path = self.paste_temp_path.join(&filename);
+
+        if let Err(e) = std::fs::create_dir_all(&self.paste_temp_path) {
+            self.status_message = format!("Cannot create paste directory: {e}");
+            return None;
+        }
 
         if let Err(e) = img.save(&path) {
             self.status_message = format!("Failed to save clipboard image: {e}");
@@ -6118,7 +6124,7 @@ impl App {
     }
 
     /// Handle the `/paste` command: read clipboard and act on contents.
-    pub fn handle_paste_command(&mut self) -> Option<SendRequest> {
+    fn handle_paste_command(&mut self) -> Option<SendRequest> {
         if self.active_conversation.is_none() {
             self.status_message = "No active conversation".to_string();
             return None;
