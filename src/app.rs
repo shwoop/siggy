@@ -9377,6 +9377,7 @@ mod tests {
 
     #[rstest]
     fn paste_text_inserts_into_input_buffer(mut app: App) {
+        // handle_paste_text delegates to handle_paste for plain text, which guards on Insert mode
         app.mode = InputMode::Insert;
         app.active_conversation = Some("test-conv".to_string());
         app.handle_paste_text("hello world");
@@ -9402,6 +9403,7 @@ mod tests {
         app.handle_paste_text("   ");
         assert!(app.status_message.contains("empty"));
         assert!(app.pending_attachment.is_none());
+        assert!(app.input_buffer.is_empty());
     }
 
     #[rstest]
