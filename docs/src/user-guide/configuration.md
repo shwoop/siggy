@@ -35,6 +35,8 @@ date_separators = true
 show_receipts = true
 color_receipts = true
 nerd_fonts = false
+emoji_to_text = false
+show_reactions = true
 reaction_verbose = false
 send_read_receipts = true
 mouse_enabled = true
@@ -64,6 +66,8 @@ proxy = ""
 | `show_receipts` | bool | `true` | Show delivery/read receipt status symbols |
 | `color_receipts` | bool | `true` | Colored receipt status symbols (vs monochrome) |
 | `nerd_fonts` | bool | `false` | Use Nerd Font glyphs for status symbols |
+| `emoji_to_text` | bool | `false` | Convert emoji to text emoticons/shortcodes |
+| `show_reactions` | bool | `true` | Show emoji reactions on messages |
 | `reaction_verbose` | bool | `false` | Show reaction sender names instead of counts |
 | `send_read_receipts` | bool | `true` | Send read receipts when viewing conversations |
 | `mouse_enabled` | bool | `true` | Enable mouse support (click sidebar, scroll, etc.) |
@@ -96,7 +100,8 @@ toggles for runtime settings:
 - Inline image previews / link previews / native images
 - Date separators
 - Show read receipts / receipt colors / nerd font icons
-- Verbose reactions
+- Emoji-to-text mode
+- Show reactions / verbose reactions
 - Send read receipts
 - Mouse support
 - Theme selector

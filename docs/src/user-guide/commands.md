@@ -11,6 +11,7 @@ All commands start with `/`. Type `/` in Insert mode to open the autocomplete po
 | `/search` | `/s` | `<query>` | Search messages across all conversations |
 | `/attach` | `/a` | | Open file browser to attach a file |
 | `/paste` | `/pa` | | Paste from clipboard (text or image) |
+| `/export` | | `[n]` | Export chat history to plain text file |
 | `/sidebar` | `/sb` | | Toggle sidebar visibility |
 | `/bell` | `/notify` | `[type]` | Toggle notifications (`direct`, `group`, or both) |
 | `/mute` | | | Mute/unmute current conversation |
@@ -151,6 +152,19 @@ to confirm (or Esc to cancel). Move to Save and press Enter to push changes.
 **Show app info:**
 ```
 /about
+```
+
+**Export chat history:**
+```
+/export
+```
+
+Exports all messages in the current conversation to a text file in your Downloads
+directory (e.g. `siggy-export-Alice-2026-03-14.txt`).
+
+**Export last 50 messages:**
+```
+/export 50
 ```
 
 ## Messaging a new contact

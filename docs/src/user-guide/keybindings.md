@@ -109,6 +109,9 @@ changes in the status bar.
 | `f` | Forward focused message |
 | `d` | Delete focused message |
 | `p` | Pin / unpin focused message |
+| `s` | Filter sidebar conversations |
+| `Q` | Jump to quoted message |
+| `Ctrl+O` | Jump back to previous position |
 | `n` | Jump to next search result |
 | `N` | Jump to previous search result |
 | `@` | Mention autocomplete (in Insert mode) |

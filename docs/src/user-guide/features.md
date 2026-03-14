@@ -51,9 +51,9 @@ via `/settings` > "Date separators" (enabled by default).
 
 ## Unread tracking
 
-The sidebar shows unread counts next to each conversation. When you open a
-conversation, a "new messages" separator line marks where you left off. Read
-markers persist across restarts.
+The sidebar shows unread counts (e.g. `(3)`) next to each conversation with a
+colored dot indicator. When you open a conversation, a "new messages" separator
+line marks where you left off. Read markers persist across restarts.
 
 Conversations automatically reorder to the top of the sidebar when messages
 are sent or received, so your most active chats are always visible.
@@ -85,6 +85,14 @@ and typing indicators.
 The sidebar auto-hides on narrow terminals (less than 60 columns). Use
 `Ctrl+Left` / `Ctrl+Right` to resize it, or `/sidebar` to toggle it.
 
+## Sidebar filter
+
+Press `s` in Normal mode to activate the sidebar filter. Type to narrow
+conversations by name -- the sidebar title changes to show your filter text
+(e.g. `/ali`). Press Enter to jump to the first match, or Esc to cancel.
+Backspacing to empty also cancels. Tab/Shift-Tab conversation switching and
+mouse clicks automatically clear the filter.
+
 ## Incognito mode
 
 ```sh
@@ -106,7 +114,11 @@ Reactions display below messages as compact badges:
 👍 2  ❤️ 1
 ```
 
+Selecting the same emoji you already reacted with removes the reaction (toggle
+behavior), matching other Signal clients.
+
 Enable "Verbose reactions" in `/settings` to show sender names instead of counts.
+To hide reactions entirely, disable "Show reactions" in `/settings`.
 Reactions sync across devices and persist in the database.
 
 ![Reactions, quote reply, link preview, and poll](../reactions-quotereply-linkpreview-poll.png)
@@ -139,6 +151,16 @@ In Normal mode, act on the focused message:
   deleted locally. Deleted messages show as "[deleted]".
 
 All three features sync across devices and persist in the database.
+
+## Jump to quoted message
+
+When a message contains a quoted reply, press `Q` in Normal mode to jump to the
+original quoted message. The viewport scrolls to show the original in context.
+Press `Ctrl+O` to jump back to where you were. Multiple jumps stack, so you can
+follow a chain of quotes and unwind them all.
+
+If the quoted message is not in the loaded message history, a status message
+indicates it's too far back.
 
 ## Message search
 
@@ -319,6 +341,15 @@ All keybindings are fully configurable. Choose from three built-in profiles
 See [Keybindings](keybindings.md) for full details on profiles, customization,
 and the TOML format.
 
+## Emoji-to-text mode
+
+Enable "Emoji to text" in `/settings` to convert emoji to text representations
+at render time. Common emoji get classic emoticons (:) :( ;) :D <3 +1 etc.),
+while all other emoji get Discord/Slack-style :shortcodes: (e.g. :fire: :wave:).
+
+This is display-only -- stored messages keep the original emoji. Applies to
+message bodies, quoted replies, system messages, and reaction summaries.
+
 ## Multi-line input
 
 Press `Alt+Enter` or `Shift+Enter` in Insert mode to insert a newline. Compose
@@ -335,6 +366,16 @@ browse your full message history without loading everything upfront.
 
 Press `f` in Normal mode on a focused message to forward it to another
 conversation. A filterable picker overlay lets you choose the destination.
+
+## Export chat history
+
+Use `/export` to save the active conversation's messages as a plain text file.
+The file is saved to your Downloads directory as `siggy-export-<name>-<date>.txt`.
+
+Use `/export <n>` to export only the last N messages (e.g. `/export 100`).
+
+The output includes timestamps, sender names, message bodies, "(edited)" labels,
+quoted replies, and system messages in a simple IRC-style format.
 
 ## Demo mode
 

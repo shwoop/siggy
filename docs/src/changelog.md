@@ -1,5 +1,50 @@
 # Changelog
 
+## v1.5.0
+
+### New features
+
+- **Sidebar filter** -- press `s` in Normal mode to type-to-filter conversations
+  in the sidebar. Filter text shows in the sidebar title. Enter selects the first
+  match, Esc cancels. Tab/Shift-Tab and mouse clicks clear the filter (#184)
+- **Unread count in sidebar** -- conversations with unread messages now show the
+  count as `(N)` next to the name, alongside the existing unread dot (#185)
+- **Jump to quoted message** -- press `Q` in Normal mode on a message with a quote
+  to jump to the original message. Press `Ctrl+O` to jump back. Supports a stack
+  for multiple jumps (#187)
+- **Export chat history** -- `/export` dumps the active conversation to a plain
+  text file in your Downloads directory. `/export 100` exports only the last 100
+  messages. Output includes timestamps, senders, edited labels, and quoted
+  replies (#191)
+- **Hide reactions** -- new "Show reactions" toggle in `/settings` (default: on).
+  When disabled, reaction summary lines are hidden from messages (#211)
+- **Emoji-to-text mode** -- new "Emoji to text" toggle in `/settings` (default:
+  off). Converts emoji to text emoticons (:) <3 +1) or :shortcodes: at render
+  time. Display-only -- stored messages keep original emoji (#213)
+
+### Bug fixes
+
+- **Reaction undo** -- selecting the same emoji you already reacted with now
+  removes the reaction instead of being a no-op, matching other Signal clients
+  (#216)
+
+### Internal
+
+- **Integration snapshot tests** -- 16 insta-based snapshot tests render the full
+  UI via ratatui's TestBackend and compare against committed .snap files. Covers
+  sidebar layout, chat messages, overlays, message features, and edge cases (#230)
+- **Search dedup** -- extracted `SearchState::open()` method and
+  `dispatch_search_action()` to remove duplicated match arms (#238)
+- **Typing state extraction** -- moved typing indicator state and logic from App
+  into `domain::TypingState` (#239)
+- **Snapshot timezone fix** -- demo timestamps built via Local timezone so
+  snapshots display stable hours across timezones (#238)
+
+Thanks to [@Dowsley](https://github.com/Dowsley) for #238 and #239,
+and [@shwoop](https://github.com/shwoop) for reporting #216.
+
+---
+
 ## v1.4.2
 
 ### Bug fixes

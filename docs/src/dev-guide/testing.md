@@ -85,6 +85,52 @@ failures are easy to identify.
 - **Don't over-parameterize.** If merging tests requires a `match` with completely
   different setup logic per arm, separate tests are clearer.
 
+## Snapshot tests (insta)
+
+Integration snapshot tests use [insta](https://insta.rs/) with ratatui's `TestBackend`
+to render the full UI and compare against committed `.snap` files. This catches layout
+regressions, missing overlays, and rendering bugs automatically.
+
+### Running snapshot tests
+
+```sh
+cargo test snapshot_tests
+```
+
+### Accepting new snapshots
+
+When you change the UI, snapshot tests will fail with a diff. Use `cargo-insta` to
+review and accept:
+
+```sh
+cargo install cargo-insta  # first time only
+cargo insta accept
+```
+
+Accepted snapshots are committed as `.snap` files in `src/snapshots/`.
+
+### Test helpers
+
+The snapshot test module (`ui::snapshot_tests`) provides:
+
+- **`demo_app()`** -- creates an App with in-memory DB, connected state, and
+  deterministic demo data (fixed date for stable timestamps)
+- **`render_to_string(app, width, height)`** -- renders via TestBackend and
+  returns the buffer as a trimmed string
+
+### Coverage
+
+Snapshot tests cover:
+- Sidebar layout and conversation list
+- Chat messages (quotes, link previews, edited messages, reactions)
+- Normal vs Insert mode indicator
+- Help, settings, and about overlays
+- Narrow terminal (sidebar auto-hide)
+- Styled text (bold, monospace)
+- Polls, pinned messages, unread markers
+- Empty conversations, message requests, disappearing messages
+- Sidebar filter
+
 ## Test modules
 
 Tests are defined as `#[cfg(test)] mod tests` blocks within each source file.
