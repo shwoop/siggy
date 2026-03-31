@@ -5,7 +5,7 @@ use ratatui::text::Line;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
 use crate::domain::{
@@ -390,7 +390,7 @@ pub struct App {
     /// Notification preferences and clipboard auto-clear state
     pub notifications: NotificationState,
     /// Conversations muted from notifications
-    pub muted_conversations: HashSet<String>,
+    pub muted_conversations: HashMap<String, i64>,
     /// Conversations blocked via signal-cli
     pub blocked_conversations: HashSet<String>,
     /// Autocomplete popup visible
@@ -2863,7 +2863,7 @@ impl App {
             connection_error: None,
             contact_names: HashMap::new(),
             notifications: NotificationState::new(),
-            muted_conversations: HashSet::new(),
+            muted_conversations: HashMap::new(),
             blocked_conversations: HashSet::new(),
             autocomplete_visible: false,
             autocomplete_candidates: Vec::new(),
@@ -3012,7 +3012,7 @@ impl App {
         }
 
         self.conversation_order = order;
-        self.muted_conversations = self.db.load_muted()?;
+        self.muted_conversations = self.db.load_mute_until()?;
         self.blocked_conversations = self.db.load_blocked()?;
 
         // Fix 1:1 conversations still named as phone numbers: scan message senders
@@ -4522,7 +4522,7 @@ impl App {
                 .map(|c| c.accepted)
                 .unwrap_or(true);
             let not_muted_or_blocked = conv_accepted
-                && !self.muted_conversations.contains(&conv_id)
+                && !self.is_muted_now(&conv_id)
                 && !self.blocked_conversations.contains(&conv_id);
             let type_enabled = if is_group {
                 self.notifications.notify_group
@@ -7163,6 +7163,29 @@ impl App {
     /// Total unread count across all conversations
     pub fn total_unread(&self) -> usize {
         self.conversations.values().map(|c| c.unread).sum()
+    }
+
+    /// Returns true if the given conversation is currently muted.
+    /// Delegates to `is_muted_at` with the current wall-clock time.
+    pub fn is_muted_now(&self, conv_id: &str) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.is_muted_at(conv_id, now)
+    }
+
+    /// Returns true if the conversation is muted at the given epoch second.
+    /// - key absent: not muted
+    /// - `mute_until = 0`: permanently muted (always true)
+    /// - `mute_until = ts`: muted while `now_secs < ts`
+    fn is_muted_at(&self, conv_id: &str, now_secs: i64) -> bool {
+        match self.muted_conversations.get(conv_id) {
+            None => false,
+            Some(&0) => true,
+            Some(&ts) if ts < 0 => false, // guard: negative timestamp = treat as unmuted
+            Some(&ts) => now_secs < ts,
+        }
     }
 
     /// Get the message at the current scroll position.
@@ -11710,5 +11733,29 @@ mod tests {
             items.iter().any(|a| a.label == "Open link"),
             "focused msg has URL, should show Open link"
         );
+    }
+
+    #[test]
+    fn is_muted_now_logic() {
+        let db = Database::open_in_memory().unwrap();
+        let mut app = App::new("+10000000000".to_string(), db);
+
+        // Not in map → not muted
+        assert!(!app.is_muted_at("a", 1000));
+
+        // Permanent mute (0)
+        app.muted_conversations.insert("a".to_string(), 0);
+        assert!(app.is_muted_at("a", 1000));
+
+        // Timed mute — not yet expired
+        app.muted_conversations.insert("b".to_string(), 2000);
+        assert!(app.is_muted_at("b", 1000));
+
+        // Timed mute — expired
+        assert!(!app.is_muted_at("b", 3000));
+
+        // Guard: negative timestamp → treat as unmuted
+        app.muted_conversations.insert("c".to_string(), -1);
+        assert!(!app.is_muted_at("c", 1000));
     }
 }
