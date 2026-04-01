@@ -69,6 +69,21 @@ fn db_warn<T>(result: Result<T, impl std::fmt::Display>, context: &str) {
     }
 }
 
+fn parse_duration(s: &str) -> Result<i64, String> {
+    if s.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let num: i64 = num_str.parse().map_err(|_| "invalid number".to_string())?;
+    match unit {
+        "m" => Ok(num * 60),
+        "h" => Ok(num * 3600),
+        "d" => Ok(num * 86400),
+        "w" => Ok(num * 604800),
+        _ => Err("invalid unit (use m, h, d, w)".to_string()),
+    }
+}
+
 impl App {
     /// Like `db_warn` but also surfaces the error in the status bar so the user sees it.
     fn db_warn_visible<T>(&mut self, result: Result<T, impl std::fmt::Display>, context: &str) {
@@ -390,7 +405,7 @@ pub struct App {
     /// Notification preferences and clipboard auto-clear state
     pub notifications: NotificationState,
     /// Conversations muted from notifications
-    pub muted_conversations: HashSet<String>,
+    pub muted_conversations: HashMap<String, i64>,
     /// Conversations blocked via signal-cli
     pub blocked_conversations: HashSet<String>,
     /// Autocomplete popup visible
@@ -2863,7 +2878,7 @@ impl App {
             connection_error: None,
             contact_names: HashMap::new(),
             notifications: NotificationState::new(),
-            muted_conversations: HashSet::new(),
+            muted_conversations: HashMap::new(),
             blocked_conversations: HashSet::new(),
             autocomplete_visible: false,
             autocomplete_candidates: Vec::new(),
@@ -4202,6 +4217,45 @@ impl App {
         }
     }
 
+    pub fn is_muted(&self, conv_id: &str) -> bool {
+        if let Some(&muted_until) = self.muted_conversations.get(conv_id) {
+            if muted_until == 1 {
+                return true;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            return muted_until > now;
+        }
+        false
+    }
+
+    pub fn mute_duration(&self, conv_id: &str) -> Option<String> {
+        if let Some(&muted_until) = self.muted_conversations.get(conv_id) {
+            if muted_until == 1 {
+                return None; // permanent
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if muted_until > now {
+                let diff = muted_until - now;
+                if diff < 60 {
+                    return Some(format!("{}s", diff));
+                } else if diff < 3600 {
+                    return Some(format!("{}m", diff / 60));
+                } else if diff < 86400 {
+                    return Some(format!("{}h", diff / 3600));
+                } else {
+                    return Some(format!("{}d", diff / 86400));
+                }
+            }
+        }
+        None
+    }
+
     fn handle_message(&mut self, msg: SignalMessage) {
         let conv_id = if let Some(ref gid) = msg.group_id {
             gid.clone()
@@ -4522,7 +4576,7 @@ impl App {
                 .map(|c| c.accepted)
                 .unwrap_or(true);
             let not_muted_or_blocked = conv_accepted
-                && !self.muted_conversations.contains(&conv_id)
+                && !self.is_muted(&conv_id)
                 && !self.blocked_conversations.contains(&conv_id);
             let type_enabled = if is_group {
                 self.notifications.notify_group
@@ -6174,26 +6228,44 @@ impl App {
                     }
                 }
             }
-            InputAction::ToggleMute => {
+            InputAction::ToggleMute(duration_str) => {
                 if let Some(ref conv_id) = self.active_conversation {
                     let conv_id = conv_id.clone();
-                    if self.muted_conversations.remove(&conv_id) {
-                        let name = self
-                            .conversations
-                            .get(&conv_id)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or(&conv_id);
-                        self.status_message = format!("unmuted {name}");
-                        db_warn(self.db.set_muted(&conv_id, false), "set_muted");
+                    let name = self
+                        .conversations
+                        .get(&conv_id)
+                        .map(|c| c.name.as_str())
+                        .unwrap_or(&conv_id)
+                        .to_string();
+
+                    if let Some(d_str) = duration_str {
+                        // Parse duration and mute
+                        let seconds = match parse_duration(&d_str) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.status_message = format!("invalid duration: {}", e);
+                                return None;
+                            }
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let until = now + seconds;
+                        self.muted_conversations.insert(conv_id.clone(), until);
+                        db_warn(self.db.set_muted(&conv_id, until), "set_muted");
+                        self.status_message = format!("muted {} for {}", name, d_str);
                     } else {
-                        let name = self
-                            .conversations
-                            .get(&conv_id)
-                            .map(|c| c.name.as_str())
-                            .unwrap_or(&conv_id);
-                        self.status_message = format!("muted {name}");
-                        self.muted_conversations.insert(conv_id.clone());
-                        db_warn(self.db.set_muted(&conv_id, true), "set_muted");
+                        // Toggle logic
+                        if self.is_muted(&conv_id) {
+                            self.muted_conversations.remove(&conv_id);
+                            self.status_message = format!("unmuted {}", name);
+                            db_warn(self.db.set_muted(&conv_id, 0), "set_muted");
+                        } else {
+                            self.status_message = format!("muted {}", name);
+                            self.muted_conversations.insert(conv_id.clone(), 1);
+                            db_warn(self.db.set_muted(&conv_id, 1), "set_muted");
+                        }
                     }
                 } else {
                     self.status_message = "no active conversation to mute".to_string();

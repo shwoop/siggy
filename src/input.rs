@@ -169,7 +169,7 @@ pub enum InputAction {
     /// Toggle terminal bell notifications (None = both, Some("direct"/"group") = specific)
     ToggleBell(Option<String>),
     /// Mute/unmute the current conversation
-    ToggleMute,
+    ToggleMute(Option<String>),
     /// Block the current contact/group
     Block,
     /// Unblock the current contact/group
@@ -251,7 +251,13 @@ pub fn parse_input(input: &str) -> InputAction {
                 InputAction::ToggleBell(Some(arg))
             }
         }
-        "/mute" => InputAction::ToggleMute,
+        "/mute" => {
+            if arg.is_empty() {
+                InputAction::ToggleMute(None)
+            } else {
+                InputAction::ToggleMute(Some(arg))
+            }
+        }
         "/block" => InputAction::Block,
         "/unblock" => InputAction::Unblock,
         "/attach" | "/a" => InputAction::Attach,
@@ -453,7 +459,8 @@ mod tests {
     #[case("/q", InputAction::Quit)]
     #[case("/sidebar", InputAction::ToggleSidebar)]
     #[case("/sb", InputAction::ToggleSidebar)]
-    #[case("/mute", InputAction::ToggleMute)]
+    #[case("/mute", InputAction::ToggleMute(None))]
+    #[case("/mute 1h", InputAction::ToggleMute(Some("1h".to_string())))]
     #[case("/settings", InputAction::Settings)]
     #[case("/attach", InputAction::Attach)]
     #[case("/a", InputAction::Attach)]
