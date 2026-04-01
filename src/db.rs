@@ -226,6 +226,17 @@ impl Database {
             )?;
         }
 
+        if version < 13 {
+            self.conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE conversations ADD COLUMN mute_expiry INTEGER;
+                UPDATE schema_version SET version = 13;
+                COMMIT;
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -781,22 +792,22 @@ impl Database {
 
     // --- Muted conversations ---
 
-    pub fn set_muted(&self, conv_id: &str, muted: bool) -> Result<()> {
+    pub fn set_muted(&self, conv_id: &str, muted: bool, expiry: Option<i64>) -> Result<()> {
         self.conn.execute(
-            "UPDATE conversations SET muted = ?2 WHERE id = ?1",
-            params![conv_id, muted as i32],
+            "UPDATE conversations SET muted = ?2, mute_expiry = ?3 WHERE id = ?1",
+            params![conv_id, muted as i32, expiry],
         )?;
         Ok(())
     }
 
-    pub fn load_muted(&self) -> Result<std::collections::HashSet<String>> {
+    pub fn load_muted(&self) -> Result<std::collections::HashMap<String, Option<i64>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM conversations WHERE muted = 1")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
+            .prepare("SELECT id, mute_expiry FROM conversations WHERE muted = 1")?;
+        let rows: Vec<(String, Option<i64>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids.into_iter().collect())
+        Ok(rows.into_iter().collect())
     }
 
     // --- Blocked conversations ---
@@ -1088,10 +1099,6 @@ mod tests {
     // --- Boolean flag round-trips: muted + blocked share identical structure ---
 
     #[rstest]
-    #[case("muted",
-        Database::set_muted as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_muted as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
     #[case("blocked",
         Database::set_blocked as fn(&Database, &str, bool) -> anyhow::Result<()>,
         Database::load_blocked as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
@@ -1113,6 +1120,31 @@ mod tests {
         setter(&db, "+1", false).unwrap();
         let set = loader(&db).unwrap();
         assert!(!set.contains("+1"));
+    }
+
+    #[rstest]
+    fn muted_round_trip_with_expiry(db: Database) {
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        db.upsert_conversation("+2", "Bob", false).unwrap();
+
+        // Mute with expiry
+        let expiry = Some(1234567890i64);
+        db.set_muted("+1", true, expiry).unwrap();
+        let map = db.load_muted().unwrap();
+        assert!(map.contains_key("+1"));
+        assert_eq!(map.get("+1"), Some(&expiry));
+        assert!(!map.contains_key("+2"));
+
+        // Mute without expiry (permanent)
+        db.set_muted("+2", true, None).unwrap();
+        let map = db.load_muted().unwrap();
+        assert_eq!(map.get("+2"), Some(&None));
+
+        // Unmute
+        db.set_muted("+1", false, None).unwrap();
+        let map = db.load_muted().unwrap();
+        assert!(!map.contains_key("+1"));
+        assert!(map.contains_key("+2"));
     }
 
     #[rstest]
