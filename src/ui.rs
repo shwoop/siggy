@@ -753,7 +753,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             // Conversation name
-            let is_muted = app.muted_conversations.contains(id);
+            let is_muted = app.muted_conversations.contains_key(id);
             let name_style = if is_active {
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
             } else if has_unread {
@@ -773,7 +773,15 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             if is_muted {
-                spans.push(Span::styled(" ~", Style::default().fg(theme.fg_muted)));
+                if let Some(remaining) = app.mute_remaining(id) {
+                    let label = crate::input::format_compact_duration(remaining);
+                    spans.push(Span::styled(
+                        format!(" ~{label}"),
+                        Style::default().fg(theme.fg_muted),
+                    ));
+                } else {
+                    spans.push(Span::styled(" ~", Style::default().fg(theme.fg_muted)));
+                }
             }
             if app.blocked_conversations.contains(id) {
                 spans.push(Span::styled(" x", Style::default().fg(theme.error)));
