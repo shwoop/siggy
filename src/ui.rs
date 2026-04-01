@@ -46,6 +46,7 @@ const EMOJI_POPUP_HEIGHT: u16 = 20;
 /// Returns a short mute indicator string for the sidebar.
 /// - `until == 0`: permanent mute → "~"
 /// - `until > 0`: timed mute → remaining time as "~Xm", "~Xh", or "~Xd"
+///
 /// `now` and `until` are Unix epoch seconds.
 fn mute_remaining_label(until: i64, now: i64) -> String {
     if until == 0 {
