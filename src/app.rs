@@ -276,6 +276,8 @@ pub struct Conversation {
     pub is_group: bool,
     /// Disappearing message timer in seconds (0 = off)
     pub expiration_timer: i64,
+    /// Mute expiry timestamp (0 = not muted, >0 = Unix timestamp when mute expires)
+    pub mute_expiry: i64,
     /// Whether this conversation has been accepted (message requests are unaccepted)
     pub accepted: bool,
 }
@@ -6194,6 +6196,52 @@ impl App {
                         self.status_message = format!("muted {name}");
                         self.muted_conversations.insert(conv_id.clone());
                         db_warn(self.db.set_muted(&conv_id, true), "set_muted");
+                    }
+                } else {
+                    self.status_message = "no active conversation to mute".to_string();
+                }
+            }
+            InputAction::SetMuteDuration(duration) => {
+                if let Some(ref conv_id) = self.active_conversation {
+                    let conv_id = conv_id.clone();
+                    match input::parse_duration_to_seconds(&duration) {
+                        Ok(seconds) => {
+                            if seconds == 0 {
+                                // Unmute
+                                if self.muted_conversations.remove(&conv_id) {
+                                    let name = self
+                                        .conversations
+                                        .get(&conv_id)
+                                        .map(|c| c.name.as_str())
+                                        .unwrap_or(&conv_id);
+                                    self.status_message = format!("unmuted {name}");
+                                } else {
+                                    let name = self
+                                        .conversations
+                                        .get(&conv_id)
+                                        .map(|c| c.name.as_str())
+                                        .unwrap_or(&conv_id);
+                                    self.status_message = format!("{name} was already unmuted");
+                                }
+                                db_warn(self.db.set_muted(&conv_id, false), "set_muted");
+                                db_warn(self.db.update_mute_expiry(&conv_id, 0), "update_mute_expiry");
+                            } else {
+                                // Set mute with expiry
+                                let expiry = Utc::now().timestamp_millis() + seconds * 1000;
+                                self.muted_conversations.insert(conv_id.clone());
+                                let name = self
+                                    .conversations
+                                    .get(&conv_id)
+                                    .map(|c| c.name.as_str())
+                                    .unwrap_or(&conv_id);
+                                self.status_message = format!("muted {name} for {}", duration);
+                                db_warn(self.db.set_muted(&conv_id, true), "set_muted");
+                                db_warn(self.db.update_mute_expiry(&conv_id, expiry), "update_mute_expiry");
+                            }
+                        }
+                        Err(e) => {
+                            self.status_message = format!("invalid duration: {e}");
+                        }
                     }
                 } else {
                     self.status_message = "no active conversation to mute".to_string();

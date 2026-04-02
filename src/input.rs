@@ -170,6 +170,8 @@ pub enum InputAction {
     ToggleBell(Option<String>),
     /// Mute/unmute the current conversation
     ToggleMute,
+    /// Set mute duration for the current conversation
+    SetMuteDuration(String),
     /// Block the current contact/group
     Block,
     /// Unblock the current contact/group
@@ -251,7 +253,13 @@ pub fn parse_input(input: &str) -> InputAction {
                 InputAction::ToggleBell(Some(arg))
             }
         }
-        "/mute" => InputAction::ToggleMute,
+        "/mute" => {
+            if arg.is_empty() {
+                InputAction::ToggleMute
+            } else {
+                InputAction::SetMuteDuration(arg)
+            }
+        },
         "/block" => InputAction::Block,
         "/unblock" => InputAction::Unblock,
         "/attach" | "/a" => InputAction::Attach,

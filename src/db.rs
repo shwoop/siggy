@@ -226,6 +226,17 @@ impl Database {
             )?;
         }
 
+        if version < 13 {
+            self.conn.execute_batch(
+                "
+                BEGIN;
+                ALTER TABLE conversations ADD COLUMN mute_expiry INTEGER NOT NULL DEFAULT 0;
+                UPDATE schema_version SET version = 13;
+                COMMIT;
+                ",
+            )?;
+        }
+
         Ok(())
     }
 
@@ -430,9 +441,9 @@ impl Database {
     pub fn load_conversations(&self, msg_limit: usize) -> Result<Vec<Conversation>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, is_group, expiration_timer, accepted FROM conversations")?;
+            .prepare("SELECT id, name, is_group, expiration_timer, accepted, mute_expiry FROM conversations")?;
 
-        let convs: Vec<(String, String, bool, i64, bool)> = stmt
+        let convs: Vec<(String, String, bool, i64, bool, i64)> = stmt
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -440,13 +451,14 @@ impl Database {
                     row.get::<_, i32>(2)? != 0,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i32>(4)? != 0,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut result = Vec::with_capacity(convs.len());
 
-        for (id, name, is_group, expiration_timer, accepted) in convs {
+        for (id, name, is_group, expiration_timer, accepted, mute_expiry) in convs {
             let messages = self.load_messages_page(&id, msg_limit, 0)?;
             let unread = self.unread_count(&id).unwrap_or(0);
 
@@ -457,6 +469,7 @@ impl Database {
                 unread,
                 is_group,
                 expiration_timer,
+                mute_expiry,
                 accepted,
             });
         }
@@ -825,6 +838,14 @@ impl Database {
         self.conn.execute(
             "UPDATE conversations SET expiration_timer = ?2 WHERE id = ?1",
             params![conv_id, seconds],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_mute_expiry(&self, conv_id: &str, expiry_ms: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET mute_expiry = ?2 WHERE id = ?1",
+            params![conv_id, expiry_ms],
         )?;
         Ok(())
     }
