@@ -781,22 +781,37 @@ impl Database {
 
     // --- Muted conversations ---
 
-    pub fn set_muted(&self, conv_id: &str, muted: bool) -> Result<()> {
+    pub fn set_muted(&self, conv_id: &str, muted_until: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE conversations SET muted = ?2 WHERE id = ?1",
-            params![conv_id, muted as i32],
+            params![conv_id, muted_until],
         )?;
         Ok(())
     }
 
-    pub fn load_muted(&self) -> Result<std::collections::HashSet<String>> {
+    pub fn load_muted(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        
+        // Clean up expired mutes first
+        self.conn.execute(
+            "UPDATE conversations SET muted = 0 WHERE muted > 1 AND muted <= ?1",
+            params![now],
+        )?;
+
         let mut stmt = self
             .conn
-            .prepare("SELECT id FROM conversations WHERE muted = 1")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
+            .prepare("SELECT id, muted FROM conversations WHERE muted > 0")?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let muted: i64 = row.get(1)?;
+                Ok((id, muted))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids.into_iter().collect())
+        Ok(rows.into_iter().collect())
     }
 
     // --- Blocked conversations ---
@@ -1085,13 +1100,41 @@ mod tests {
         assert_eq!(order[1], "+1");
     }
 
-    // --- Boolean flag round-trips: muted + blocked share identical structure ---
+    #[test]
+    fn muted_round_trip() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_conversation("+1", "Alice", false).unwrap();
+        db.upsert_conversation("+2", "Bob", false).unwrap();
+
+        // Initially empty
+        assert!(db.load_muted().unwrap().is_empty());
+
+        // Set one muted
+        db.set_muted("+1", 1).unwrap();
+        let loaded = db.load_muted().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("+1"), Some(&1));
+
+        // Set another muted with timestamp
+        let future_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64 + 3600;
+        db.set_muted("+2", future_ts).unwrap();
+        let loaded = db.load_muted().unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get("+2"), Some(&future_ts));
+
+        // Unset
+        db.set_muted("+1", 0).unwrap();
+        let loaded = db.load_muted().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded.contains_key("+1"));
+    }
+
+    // --- Boolean flag round-trips: blocked ---
 
     #[rstest]
-    #[case("muted",
-        Database::set_muted as fn(&Database, &str, bool) -> anyhow::Result<()>,
-        Database::load_muted as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
-    )]
     #[case("blocked",
         Database::set_blocked as fn(&Database, &str, bool) -> anyhow::Result<()>,
         Database::load_blocked as fn(&Database) -> anyhow::Result<std::collections::HashSet<String>>
