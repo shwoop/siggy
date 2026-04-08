@@ -34,8 +34,8 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "/mute",
         alias: "",
-        args: "",
-        description: "Mute/unmute current chat",
+        args: "[duration]",
+        description: "Mute/unmute current chat (optional: 30m/1h/8h/1d/1w)",
     },
     CommandInfo {
         name: "/block",
@@ -168,8 +168,8 @@ pub enum InputAction {
     ToggleSidebar,
     /// Toggle terminal bell notifications (None = both, Some("direct"/"group") = specific)
     ToggleBell(Option<String>),
-    /// Mute/unmute the current conversation
-    ToggleMute,
+    /// Mute/unmute the current conversation (optional duration in seconds)
+    ToggleMute(Option<i64>),
     /// Block the current contact/group
     Block,
     /// Unblock the current contact/group
@@ -251,7 +251,16 @@ pub fn parse_input(input: &str) -> InputAction {
                 InputAction::ToggleBell(Some(arg))
             }
         }
-        "/mute" => InputAction::ToggleMute,
+        "/mute" => {
+            if arg.is_empty() {
+                InputAction::ToggleMute(None)
+            } else {
+                match parse_duration_to_seconds(&arg) {
+                    Ok(seconds) => InputAction::ToggleMute(Some(seconds)),
+                    Err(e) => InputAction::Unknown(format!("/mute: {e}")),
+                }
+            }
+        }
         "/block" => InputAction::Block,
         "/unblock" => InputAction::Unblock,
         "/attach" | "/a" => InputAction::Attach,
@@ -453,7 +462,7 @@ mod tests {
     #[case("/q", InputAction::Quit)]
     #[case("/sidebar", InputAction::ToggleSidebar)]
     #[case("/sb", InputAction::ToggleSidebar)]
-    #[case("/mute", InputAction::ToggleMute)]
+    #[case("/mute", InputAction::ToggleMute(None))]
     #[case("/settings", InputAction::Settings)]
     #[case("/attach", InputAction::Attach)]
     #[case("/a", InputAction::Attach)]
