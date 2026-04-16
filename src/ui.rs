@@ -892,6 +892,18 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
 
+            // Mute indicator
+            let now = chrono::Utc::now();
+            if let Some(indicator) = app
+                .active_mute(id, now)
+                .and_then(|m| m.sidebar_indicator(now))
+            {
+                spans.push(Span::styled(
+                    format!("{} ", indicator.trim_start()),
+                    Style::default().fg(theme.fg_muted),
+                ));
+            }
+
             // Scroll indicator in title
             let right = if app.scroll_offset > 0 {
                 format!(" \u{2191} {} more ", app.scroll_offset)
