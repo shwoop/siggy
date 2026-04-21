@@ -1,3 +1,9 @@
+//! Popup state for slash-command, @mention, and group-join autocomplete.
+//!
+//! Holds the current candidate list, selected index, and any pending
+//! `@mention` resolutions. The behavior (filter logic, key handling) lives
+//! in [`crate::app`]; this module owns only the data.
+
 /// Which autocomplete mode is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutocompleteMode {
@@ -9,8 +15,6 @@ pub enum AutocompleteMode {
 
 /// Autocomplete popup state: candidates, selection index, and pending mentions.
 pub struct AutocompleteState {
-    /// Autocomplete popup visible
-    pub visible: bool,
     /// Indices into COMMANDS for current matches
     pub command_candidates: Vec<usize>,
     /// Selected item in autocomplete popup
@@ -36,7 +40,6 @@ impl Default for AutocompleteState {
 impl AutocompleteState {
     pub fn new() -> Self {
         Self {
-            visible: false,
             command_candidates: Vec::new(),
             index: 0,
             mode: AutocompleteMode::Command,
@@ -61,9 +64,9 @@ impl AutocompleteState {
         }
     }
 
-    /// Clear all candidates and hide the popup.
+    /// Clear all candidates. Caller must also call `App::close_overlay`
+    /// if the autocomplete overlay was open.
     pub fn clear(&mut self) {
-        self.visible = false;
         self.command_candidates.clear();
         self.mention_candidates.clear();
         self.join_candidates.clear();

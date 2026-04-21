@@ -1,9 +1,18 @@
+//! SQLite persistence layer (WAL mode).
+//!
+//! Three core tables: `conversations`, `messages`, `read_markers`. Schema
+//! migrations are version-based (see private `migrate`). Read paths
+//! propagate errors via `?`; write paths are logged via
+//! [`crate::conversation_store::db_warn`] (silent) or
+//! `App::db_warn_visible` (surfaces in the status bar) so transient
+//! persistence failures don't break the UI.
+
 use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::app::{Conversation, DisplayMessage};
 use crate::mute::MuteState;
@@ -453,10 +462,10 @@ impl Database {
 
         // Attach poll votes
         for msg in &mut messages {
-            if msg.poll_data.is_some() {
-                if let Ok(votes) = self.load_poll_votes(conv_id, msg.timestamp_ms) {
-                    msg.poll_votes = votes;
-                }
+            if msg.poll_data.is_some()
+                && let Ok(votes) = self.load_poll_votes(conv_id, msg.timestamp_ms)
+            {
+                msg.poll_votes = votes;
             }
         }
 
@@ -1012,16 +1021,16 @@ impl Database {
             )
             .ok()
             .flatten();
-        if let Some(json_str) = poll_json {
-            if let Ok(mut poll_data) = serde_json::from_str::<PollData>(&json_str) {
-                poll_data.closed = true;
-                let updated = serde_json::to_string(&poll_data)?;
-                self.conn.execute(
-                    "UPDATE messages SET poll_data = ?3
+        if let Some(json_str) = poll_json
+            && let Ok(mut poll_data) = serde_json::from_str::<PollData>(&json_str)
+        {
+            poll_data.closed = true;
+            let updated = serde_json::to_string(&poll_data)?;
+            self.conn.execute(
+                "UPDATE messages SET poll_data = ?3
                      WHERE conversation_id = ?1 AND timestamp_ms = ?2",
-                    params![conv_id, poll_timestamp, updated],
-                )?;
-            }
+                params![conv_id, poll_timestamp, updated],
+            )?;
         }
         Ok(())
     }

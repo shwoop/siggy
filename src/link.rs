@@ -1,15 +1,22 @@
+//! Device linking against an existing Signal account.
+//!
+//! Spawns `signal-cli link`, parses the linking URI from stdout, renders a
+//! QR code in the terminal, and waits for the user to scan it from their
+//! primary device. On success, polls account registration until signal-cli
+//! reports the new device is provisioned.
+
 use std::io;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Flex, Layout},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Terminal,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
@@ -218,18 +225,18 @@ async fn show_qr_and_wait(
         }
 
         // Poll for keyboard input
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+        {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            match (key.modifiers, key.code) {
+                (_, KeyCode::Esc) | (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                    let _ = child.kill().await;
+                    return Ok(LinkResult::Cancelled);
                 }
-                match (key.modifiers, key.code) {
-                    (_, KeyCode::Esc) | (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
-                        let _ = child.kill().await;
-                        return Ok(LinkResult::Cancelled);
-                    }
-                    _ => {}
-                }
+                _ => {}
             }
         }
     }

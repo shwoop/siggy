@@ -1,4 +1,12 @@
+//! Stateless rendering layer.
+//!
+//! [`draw`] takes the current [`App`] and renders sidebar + chat + status
+//! bar each frame. Sender colors are hash-based across an 8-color palette;
+//! groups are prefixed with `#`. OSC 8 hyperlinks are injected post-render
+//! to dodge ratatui width calculation bugs (see [`LinkRegion`]).
+
 use ratatui::{
+    Frame,
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
@@ -7,16 +15,15 @@ use ratatui::{
         Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Wrap,
     },
-    Frame,
 };
 
 use crate::app::{
-    App, AutocompleteMode, GroupMenuState, InputMode, SettingDef, VisibleImage, PIN_DURATIONS,
-    QUICK_REACTIONS, SETTINGS,
+    App, AutocompleteMode, GroupMenuState, InputMode, OverlayKind, PIN_DURATIONS, QUICK_REACTIONS,
+    SETTINGS, SettingDef, VisibleImage,
 };
 use crate::domain::CATEGORIES;
 use crate::image_render::{self, ImageProtocol};
-use crate::input::{format_compact_duration, COMMANDS};
+use crate::input::{COMMANDS, format_compact_duration};
 use crate::keybindings::{self, BindingMode, KeyAction};
 use crate::list_overlay;
 use crate::signal::types::{MessageStatus, PollData, PollVote, Reaction, StyleType, TrustLevel};
@@ -590,7 +597,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status_bar(frame, app, status_area, sidebar_auto_hidden);
 
     // Autocomplete popup (overlays everything)
-    if app.autocomplete.visible {
+    if app.is_overlay(OverlayKind::Autocomplete) {
         let has_items = !app.autocomplete.is_empty();
         if has_items {
             draw_autocomplete(frame, app, input_area);
@@ -598,107 +605,107 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Settings overlay (overlays everything)
-    if app.show_settings {
+    if app.is_overlay(OverlayKind::Settings) {
         draw_settings(frame, app, size);
     }
 
     // Customize sub-menu overlay (Theme, Keybindings, Profile)
-    if app.show_customize {
+    if app.is_overlay(OverlayKind::Customize) {
         draw_customize(frame, app, size);
     }
 
     // Help overlay (overlays everything)
-    if app.show_help {
+    if app.is_overlay(OverlayKind::Help) {
         draw_help(frame, app, size);
     }
 
     // Contacts overlay (overlays everything)
-    if app.contacts_overlay.show {
+    if app.is_overlay(OverlayKind::Contacts) {
         draw_contacts(frame, app, size);
     }
 
     // Verify identity overlay
-    if app.verify.show {
+    if app.is_overlay(OverlayKind::Verify) {
         draw_verify(frame, app, size);
     }
 
     // Search overlay
-    if app.search.visible {
+    if app.is_overlay(OverlayKind::Search) {
         draw_search(frame, app, size);
     }
 
     // File browser overlay
-    if app.file_picker.visible {
+    if app.is_overlay(OverlayKind::FilePicker) {
         draw_file_browser(frame, app, size);
     }
 
     // Group management menu overlay
-    if app.group_menu.state.is_some() {
+    if app.is_overlay(OverlayKind::GroupMenu) {
         draw_group_menu(frame, app, size);
     }
 
     // Message request overlay
-    if app.show_message_request {
+    if app.is_overlay(OverlayKind::MessageRequest) {
         draw_message_request(frame, app, size);
     }
 
     // Action menu overlay
-    if app.action_menu.show {
+    if app.is_overlay(OverlayKind::ActionMenu) {
         draw_action_menu(frame, app, size);
     }
 
     // Reaction picker overlay
-    if app.reactions.show_picker {
+    if app.is_overlay(OverlayKind::ReactionPicker) {
         draw_reaction_picker(frame, app, size);
     }
 
     // Emoji picker overlay
-    if app.emoji_picker.visible {
+    if app.is_overlay(OverlayKind::EmojiPicker) {
         draw_emoji_picker(frame, app, size);
     }
 
     // Delete confirmation overlay
-    if app.show_delete_confirm {
+    if app.is_overlay(OverlayKind::DeleteConfirm) {
         draw_delete_confirm(frame, app, size);
     }
 
     // Theme picker overlay
-    if app.theme_picker.show {
+    if app.is_overlay(OverlayKind::ThemePicker) {
         draw_theme_picker(frame, app, size);
     }
 
     // Keybindings overlay
-    if app.keybindings_overlay.show {
+    if app.is_overlay(OverlayKind::Keybindings) {
         draw_keybindings(frame, app, size);
     }
 
     // Settings profile manager overlay
-    if app.settings_profiles.show {
+    if app.is_overlay(OverlayKind::SettingsProfiles) {
         draw_settings_profile_manager(frame, app, size);
     }
 
     // Pin duration picker overlay
-    if app.pin_duration.show {
+    if app.is_overlay(OverlayKind::PinDuration) {
         draw_pin_duration_picker(frame, app, size);
     }
 
     // Poll vote overlay
-    if app.poll_vote.show {
+    if app.is_overlay(OverlayKind::PollVote) {
         draw_poll_vote_overlay(frame, app, size);
     }
 
     // About overlay
-    if app.show_about {
+    if app.is_overlay(OverlayKind::About) {
         draw_about(frame, app, size);
     }
 
     // Profile editor overlay
-    if app.profile.show {
+    if app.is_overlay(OverlayKind::Profile) {
         draw_profile(frame, app, size);
     }
 
     // Forward message picker overlay
-    if app.forward.show {
+    if app.is_overlay(OverlayKind::Forward) {
         draw_forward(frame, app, size);
     }
 
@@ -708,10 +715,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Resolve hidden URLs for attachment links (display text has no URI scheme)
     for link in &mut app.image.link_regions {
-        if !link.url.contains("://") {
-            if let Some(url) = app.image.link_url_map.get(&link.text) {
-                link.url = url.clone();
-            }
+        if !link.url.contains("://")
+            && let Some(url) = app.image.link_url_map.get(&link.text)
+        {
+            link.url = url.clone();
         }
     }
 }
@@ -723,7 +730,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     // Use filtered list when sidebar filter is active.
     // When filtering, show everything (so users can find hidden conversations).
     // In normal view, hide stale conversations (empty groups, unresolvable contacts).
-    let display_order: Vec<String> = if app.sidebar_filter_active {
+    let display_order: Vec<String> = if app.is_overlay(OverlayKind::SidebarFilter) {
         if app.sidebar_filter.is_empty() {
             app.store.conversation_order.clone()
         } else {
@@ -823,7 +830,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         Borders::RIGHT
     };
-    let title = if app.sidebar_filter_active {
+    let title = if app.is_overlay(OverlayKind::SidebarFilter) {
         if app.sidebar_filter.is_empty() {
             " /_ ".to_string()
         } else {
@@ -832,7 +839,7 @@ fn draw_sidebar(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         " Chats ".to_string()
     };
-    let title_style = if app.sidebar_filter_active {
+    let title_style = if app.is_overlay(OverlayKind::SidebarFilter) {
         Style::default()
             .fg(theme.warning)
             .add_modifier(Modifier::BOLD)
@@ -900,23 +907,23 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             // Trust level indicator (1:1 only)
-            if !conv.is_group {
-                if let Some(trust) = app.identity_trust.get(id) {
-                    match trust {
-                        TrustLevel::TrustedVerified => {
-                            spans.push(Span::styled(
-                                "\u{2713} verified ",
-                                Style::default().fg(theme.accent),
-                            ));
-                        }
-                        TrustLevel::Untrusted => {
-                            spans.push(Span::styled(
-                                "\u{26A0} untrusted ",
-                                Style::default().fg(theme.warning),
-                            ));
-                        }
-                        TrustLevel::TrustedUnverified => {} // normal state, no indicator
+            if !conv.is_group
+                && let Some(trust) = app.identity_trust.get(id)
+            {
+                match trust {
+                    TrustLevel::TrustedVerified => {
+                        spans.push(Span::styled(
+                            "\u{2713} verified ",
+                            Style::default().fg(theme.accent),
+                        ));
                     }
+                    TrustLevel::Untrusted => {
+                        spans.push(Span::styled(
+                            "\u{26A0} untrusted ",
+                            Style::default().fg(theme.warning),
+                        ));
+                    }
+                    TrustLevel::TrustedUnverified => {} // normal state, no indicator
                 }
             }
 
@@ -998,16 +1005,16 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
         (None, full_inner)
     };
 
-    if let Some(ref pin_text) = pinned_banner_text {
-        if let Some(banner) = banner_area {
-            let pin_line = Line::from(Span::styled(
-                truncate(pin_text, banner.width as usize),
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            frame.render_widget(Paragraph::new(pin_line), banner);
-        }
+    if let Some(ref pin_text) = pinned_banner_text
+        && let Some(banner) = banner_area
+    {
+        let pin_line = Line::from(Span::styled(
+            truncate(pin_text, banner.width as usize),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(Paragraph::new(pin_line), banner);
     }
 
     app.mouse_messages_area = inner;
@@ -1138,12 +1145,11 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
             let mut spans = Vec::new();
 
             // Status symbol for outgoing messages (before timestamp)
-            if app.show_receipts {
-                if let Some(status) = msg.status {
-                    let (sym, color) =
-                        status_symbol(status, app.nerd_fonts, app.color_receipts, theme);
-                    spans.push(Span::styled(format!("{sym} "), Style::default().fg(color)));
-                }
+            if app.show_receipts
+                && let Some(status) = msg.status
+            {
+                let (sym, color) = status_symbol(status, app.nerd_fonts, app.color_receipts, theme);
+                spans.push(Span::styled(format!("{sym} "), Style::default().fg(color)));
             }
 
             if msg.expires_in_seconds > 0 {
@@ -1237,83 +1243,81 @@ fn draw_messages(frame: &mut Frame, app: &mut App, area: Rect) {
             }
 
             // Render inline image preview if available (skip for deleted, skip if images disabled)
-            if !msg.is_deleted && app.image.image_mode != "none" {
-                if let Some(ref image_lines) = msg.image_lines {
-                    let first_idx = lines.len();
-                    let count = image_lines.len();
-                    for line in image_lines {
-                        lines.push(line.clone());
-                        line_msg_idx.push(Some(msg_index));
-                    }
-                    // Record for native protocol overlay
-                    if use_native {
-                        if let Some(ref path) = msg.image_path {
-                            image_records.push((first_idx, count, path.clone()));
-                        }
-                    }
+            if !msg.is_deleted
+                && app.image.image_mode != "none"
+                && let Some(ref image_lines) = msg.image_lines
+            {
+                let first_idx = lines.len();
+                let count = image_lines.len();
+                for line in image_lines {
+                    lines.push(line.clone());
+                    line_msg_idx.push(Some(msg_index));
+                }
+                // Record for native protocol overlay
+                if use_native && let Some(ref path) = msg.image_path {
+                    image_records.push((first_idx, count, path.clone()));
                 }
             }
 
             // Render link preview block
-            if !msg.is_deleted && app.image.show_link_previews {
-                if let Some(ref preview) = msg.preview {
-                    if let Some(ref title) = preview.title {
-                        lines.push(Line::from(vec![
-                            Span::styled("  \u{251C} ", Style::default().fg(theme.link)),
-                            Span::styled(
-                                truncate(title, 60),
-                                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                        line_msg_idx.push(Some(msg_index));
-                    }
-                    if let Some(ref desc) = preview.description {
-                        // Description is a middle line; URL always follows
-                        lines.push(Line::from(vec![
-                            Span::styled("  \u{251C} ", Style::default().fg(theme.link)),
-                            Span::styled(truncate(desc, 60), Style::default().fg(theme.fg_muted)),
-                        ]));
-                        line_msg_idx.push(Some(msg_index));
-                    }
+            if !msg.is_deleted
+                && app.image.show_link_previews
+                && let Some(ref preview) = msg.preview
+            {
+                if let Some(ref title) = preview.title {
                     lines.push(Line::from(vec![
-                        Span::styled("  \u{2570} ", Style::default().fg(theme.link)),
+                        Span::styled("  \u{251C} ", Style::default().fg(theme.link)),
                         Span::styled(
-                            truncate(&preview.url, 60),
-                            Style::default()
-                                .fg(theme.link)
-                                .add_modifier(Modifier::UNDERLINED),
+                            truncate(title, 60),
+                            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                         ),
                     ]));
                     line_msg_idx.push(Some(msg_index));
+                }
+                if let Some(ref desc) = preview.description {
+                    // Description is a middle line; URL always follows
+                    lines.push(Line::from(vec![
+                        Span::styled("  \u{251C} ", Style::default().fg(theme.link)),
+                        Span::styled(truncate(desc, 60), Style::default().fg(theme.fg_muted)),
+                    ]));
+                    line_msg_idx.push(Some(msg_index));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("  \u{2570} ", Style::default().fg(theme.link)),
+                    Span::styled(
+                        truncate(&preview.url, 60),
+                        Style::default()
+                            .fg(theme.link)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                ]));
+                line_msg_idx.push(Some(msg_index));
 
-                    // Render link preview thumbnail (only when images enabled)
-                    if app.image.image_mode != "none" {
-                        if let Some(ref img_lines) = msg.preview_image_lines {
-                            let first_idx = lines.len();
-                            let count = img_lines.len();
-                            for line in img_lines {
-                                lines.push(line.clone());
-                                line_msg_idx.push(Some(msg_index));
-                            }
-                            if use_native {
-                                if let Some(ref path) = msg.preview_image_path {
-                                    image_records.push((first_idx, count, path.clone()));
-                                }
-                            }
-                        }
+                // Render link preview thumbnail (only when images enabled)
+                if app.image.image_mode != "none"
+                    && let Some(ref img_lines) = msg.preview_image_lines
+                {
+                    let first_idx = lines.len();
+                    let count = img_lines.len();
+                    for line in img_lines {
+                        lines.push(line.clone());
+                        line_msg_idx.push(Some(msg_index));
+                    }
+                    if use_native && let Some(ref path) = msg.preview_image_path {
+                        image_records.push((first_idx, count, path.clone()));
                     }
                 }
             }
 
             // Render inline poll display
-            if !msg.is_deleted {
-                if let Some(ref poll_data) = msg.poll_data {
-                    let poll_lines =
-                        build_poll_display(poll_data, &msg.poll_votes, &app.account, theme);
-                    for line in poll_lines {
-                        lines.push(line);
-                        line_msg_idx.push(Some(msg_index));
-                    }
+            if !msg.is_deleted
+                && let Some(ref poll_data) = msg.poll_data
+            {
+                let poll_lines =
+                    build_poll_display(poll_data, &msg.poll_votes, &app.account, theme);
+                for line in poll_lines {
+                    lines.push(line);
+                    line_msg_idx.push(Some(msg_index));
                 }
             }
 
@@ -4939,7 +4943,7 @@ mod snapshot_tests {
     use crate::domain::EmojiPickerSource;
     use crate::image_render::ImageProtocol;
     use chrono::NaiveDate;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
 
     /// Fixed date for deterministic timestamps in snapshots.
     fn fixed_date() -> NaiveDate {
@@ -5070,7 +5074,7 @@ mod snapshot_tests {
     #[test]
     fn test_help_overlay() {
         let mut app = demo_app();
-        app.show_help = true;
+        app.open_overlay(OverlayKind::Help);
         let output = render_to_string(&mut app, 100, 30);
         insta::assert_snapshot!(output);
     }
@@ -5128,7 +5132,7 @@ mod snapshot_tests {
     #[test]
     fn test_settings_overlay() {
         let mut app = demo_app();
-        app.show_settings = true;
+        app.open_overlay(OverlayKind::Settings);
         let output = render_to_string(&mut app, 100, 30);
         insta::assert_snapshot!(output);
     }
@@ -5136,7 +5140,7 @@ mod snapshot_tests {
     #[test]
     fn test_about_overlay() {
         let mut app = demo_app();
-        app.show_about = true;
+        app.open_overlay(OverlayKind::About);
         let output = render_to_string(&mut app, 100, 30);
         insta::assert_snapshot!(output);
     }
@@ -5187,7 +5191,7 @@ mod snapshot_tests {
     #[test]
     fn test_sidebar_filter() {
         let mut app = demo_app();
-        app.sidebar_filter_active = true;
+        app.open_overlay(OverlayKind::SidebarFilter);
         app.sidebar_filter = "ali".to_string();
         app.refresh_sidebar_filter();
         let output = render_to_string(&mut app, 100, 30);
@@ -5197,7 +5201,7 @@ mod snapshot_tests {
     #[test]
     fn test_theme_picker_overlay() {
         let mut app = demo_app();
-        app.theme_picker.show = true;
+        app.open_overlay(OverlayKind::ThemePicker);
         app.theme_picker.index = 1;
         let output = render_to_string(&mut app, 100, 30);
         insta::assert_snapshot!(output);
@@ -5206,7 +5210,7 @@ mod snapshot_tests {
     #[test]
     fn test_pin_duration_overlay() {
         let mut app = demo_app();
-        app.pin_duration.show = true;
+        app.open_overlay(OverlayKind::PinDuration);
         app.pin_duration.index = 1;
         app.pin_duration.pending = Some(PinPending {
             conv_id: "+15551234567".to_string(),
@@ -5221,7 +5225,7 @@ mod snapshot_tests {
     #[test]
     fn test_action_menu_overlay() {
         let mut app = demo_app();
-        app.action_menu.show = true;
+        app.open_overlay(OverlayKind::ActionMenu);
         app.action_menu.index = 0;
         app.focused_msg_index = Some(0);
         let output = render_to_string(&mut app, 100, 30);
@@ -5231,7 +5235,7 @@ mod snapshot_tests {
     #[test]
     fn test_contacts_overlay() {
         let mut app = demo_app();
-        app.contacts_overlay.show = true;
+        app.open_overlay(OverlayKind::Contacts);
         app.contacts_overlay.index = 0;
         app.contacts_overlay.filtered = vec![
             ("+15551234567".to_string(), "Alice".to_string()),
@@ -5244,7 +5248,7 @@ mod snapshot_tests {
     #[test]
     fn test_forward_overlay() {
         let mut app = demo_app();
-        app.forward.show = true;
+        app.open_overlay(OverlayKind::Forward);
         app.forward.index = 0;
         app.forward.filtered = vec![
             ("+15551234567".to_string(), "Alice".to_string()),
@@ -5259,6 +5263,7 @@ mod snapshot_tests {
     fn test_emoji_picker_overlay() {
         let mut app = demo_app();
         app.emoji_picker.open(EmojiPickerSource::Input, None);
+        app.open_overlay(OverlayKind::EmojiPicker);
         let output = render_to_string(&mut app, 100, 30);
         insta::assert_snapshot!(output);
     }

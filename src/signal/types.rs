@@ -1,3 +1,9 @@
+//! Wire types shared between [`super::client`] and the binary's `app` module.
+//!
+//! Defines [`SignalEvent`] (the channel payload), [`SignalMessage`],
+//! [`Contact`], [`Group`], JSON-RPC framing structs, and the per-message
+//! status / trust / reaction value types.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +69,8 @@ impl TrustLevel {
 #[derive(Debug, Clone)]
 pub struct IdentityInfo {
     pub number: Option<String>,
+    /// Only read by tests today; kept on the wire type for parity with
+    /// signal-cli's identity payload.
     #[allow(dead_code)]
     pub uuid: Option<String>,
     pub fingerprint: String,
@@ -138,9 +146,7 @@ pub enum SignalEvent {
     },
     EditReceived {
         conv_id: String,
-        #[allow(dead_code)]
         sender: String,
-        #[allow(dead_code)]
         sender_name: Option<String>,
         target_timestamp: i64,
         new_body: String,
@@ -222,62 +228,105 @@ impl SignalEvent {
                 msg.attachments.len(),
                 msg.group_id.is_some(),
             ),
-            Self::ReceiptReceived { sender, receipt_type, timestamps } => format!(
+            Self::ReceiptReceived {
+                sender,
+                receipt_type,
+                timestamps,
+            } => format!(
                 "ReceiptReceived({receipt_type} from={}, count={})",
-                mask_phone(sender), timestamps.len(),
+                mask_phone(sender),
+                timestamps.len(),
             ),
-            Self::SendTimestamp { rpc_id, server_ts } => format!(
-                "SendTimestamp(rpc={rpc_id}, ts={server_ts})",
-            ),
+            Self::SendTimestamp { rpc_id, server_ts } => {
+                format!("SendTimestamp(rpc={rpc_id}, ts={server_ts})",)
+            }
             Self::SendFailed { rpc_id } => format!("SendFailed(rpc={rpc_id})"),
-            Self::TypingIndicator { sender, is_typing, .. } => format!(
+            Self::TypingIndicator {
+                sender, is_typing, ..
+            } => format!(
                 "TypingIndicator(from={}, typing={is_typing})",
                 mask_phone(sender),
             ),
-            Self::ReactionReceived { conv_id, emoji, sender, target_timestamp, is_remove, .. } => format!(
+            Self::ReactionReceived {
+                conv_id,
+                emoji,
+                sender,
+                target_timestamp,
+                is_remove,
+                ..
+            } => format!(
                 "ReactionReceived(conv={}, from={}, emoji={emoji}, target_ts={target_timestamp}, remove={is_remove})",
-                mask_phone(conv_id), mask_phone(sender),
+                mask_phone(conv_id),
+                mask_phone(sender),
             ),
-            Self::EditReceived { conv_id, target_timestamp, new_body, .. } => format!(
+            Self::EditReceived {
+                conv_id,
+                target_timestamp,
+                new_body,
+                ..
+            } => format!(
                 "EditReceived(conv={}, target_ts={target_timestamp}, body={})",
-                mask_phone(conv_id), mask_body(new_body),
+                mask_phone(conv_id),
+                mask_body(new_body),
             ),
-            Self::RemoteDeleteReceived { conv_id, target_timestamp, .. } => format!(
+            Self::RemoteDeleteReceived {
+                conv_id,
+                target_timestamp,
+                ..
+            } => format!(
                 "RemoteDeleteReceived(conv={}, target_ts={target_timestamp})",
                 mask_phone(conv_id),
             ),
-            Self::PinReceived { conv_id, target_timestamp, .. } => format!(
+            Self::PinReceived {
+                conv_id,
+                target_timestamp,
+                ..
+            } => format!(
                 "PinReceived(conv={}, target_ts={target_timestamp})",
                 mask_phone(conv_id),
             ),
-            Self::UnpinReceived { conv_id, target_timestamp, .. } => format!(
+            Self::UnpinReceived {
+                conv_id,
+                target_timestamp,
+                ..
+            } => format!(
                 "UnpinReceived(conv={}, target_ts={target_timestamp})",
                 mask_phone(conv_id),
             ),
-            Self::PollCreated { conv_id, timestamp, .. } => format!(
-                "PollCreated(conv={}, ts={timestamp})",
-                mask_phone(conv_id),
-            ),
-            Self::PollVoteReceived { conv_id, target_timestamp, voter, .. } => format!(
+            Self::PollCreated {
+                conv_id, timestamp, ..
+            } => format!("PollCreated(conv={}, ts={timestamp})", mask_phone(conv_id),),
+            Self::PollVoteReceived {
+                conv_id,
+                target_timestamp,
+                voter,
+                ..
+            } => format!(
                 "PollVoteReceived(conv={}, target_ts={target_timestamp}, voter={})",
-                mask_phone(conv_id), mask_phone(voter),
+                mask_phone(conv_id),
+                mask_phone(voter),
             ),
-            Self::PollTerminated { conv_id, target_timestamp } => format!(
+            Self::PollTerminated {
+                conv_id,
+                target_timestamp,
+            } => format!(
                 "PollTerminated(conv={}, target_ts={target_timestamp})",
                 mask_phone(conv_id),
             ),
             Self::SystemMessage { conv_id, body, .. } => format!(
                 "SystemMessage(conv={}, body={})",
-                mask_phone(conv_id), mask_body(body),
+                mask_phone(conv_id),
+                mask_body(body),
             ),
-            Self::ExpirationTimerChanged { conv_id, seconds, .. } => format!(
+            Self::ExpirationTimerChanged {
+                conv_id, seconds, ..
+            } => format!(
                 "ExpirationTimerChanged(conv={}, seconds={seconds})",
                 mask_phone(conv_id),
             ),
-            Self::ReadSyncReceived { read_messages } => format!(
-                "ReadSyncReceived(count={})",
-                read_messages.len(),
-            ),
+            Self::ReadSyncReceived { read_messages } => {
+                format!("ReadSyncReceived(count={})", read_messages.len(),)
+            }
             Self::ContactList(contacts) => format!("ContactList(count={})", contacts.len()),
             Self::GroupList(groups) => format!("GroupList(count={})", groups.len()),
             Self::IdentityList(ids) => format!("IdentityList(count={})", ids.len()),

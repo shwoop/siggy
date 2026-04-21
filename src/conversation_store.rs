@@ -1,3 +1,9 @@
+//! Conversation, message, and contact storage extracted from [`crate::app::App`].
+//!
+//! [`ConversationStore`] owns the in-memory conversation map, ordered
+//! sidebar list, contact-name and UUID lookups, and per-conversation read
+//! markers. Mutations also persist via [`crate::db::Database`].
+
 use chrono::{DateTime, Local, Utc};
 use ratatui::text::Line;
 use std::collections::{HashMap, HashSet};
@@ -303,6 +309,17 @@ impl ConversationStore {
         self.conversations.get_mut(id).unwrap()
     }
 
+    /// Remember a contact's display name if not already known.
+    /// No-op when `name` is `None`. Used by signal-event handlers to learn
+    /// names from envelopes (typing indicators, reactions, edits, pins, votes).
+    pub fn remember_contact_name(&mut self, id: &str, name: Option<&str>) {
+        if let Some(name) = name {
+            self.contact_names
+                .entry(id.to_string())
+                .or_insert_with(|| name.to_string());
+        }
+    }
+
     /// Move a conversation to the top of the sidebar order.
     /// Returns `true` if the conversation was actually reordered.
     pub fn move_conversation_to_top(&mut self, id: &str) -> bool {
@@ -493,5 +510,21 @@ impl ConversationStore {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remember_contact_name_respects_existing_entry() {
+        let mut s = ConversationStore::new();
+        s.remember_contact_name("+1", None);
+        assert!(!s.contact_names.contains_key("+1"));
+        s.remember_contact_name("+1", Some("Alice"));
+        assert_eq!(s.contact_names["+1"], "Alice");
+        s.remember_contact_name("+1", Some("Overwrite?"));
+        assert_eq!(s.contact_names["+1"], "Alice");
     }
 }

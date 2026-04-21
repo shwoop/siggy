@@ -1,3 +1,11 @@
+//! Central application state and event handling.
+//!
+//! [`App`] owns conversations, input buffer, mode (Normal/Insert), and every
+//! overlay state struct. [`App::handle_signal_event`] is the single entry point
+//! for all backend events from `signal::client`. Conversations are keyed by
+//! phone number (1:1) or group ID; the [`ConversationStore`] sub-struct holds
+//! the persistent map and ordered sidebar list.
+
 use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -9,8 +17,8 @@ use std::time::Instant;
 
 pub use crate::autocomplete::AutocompleteMode;
 use crate::autocomplete::AutocompleteState;
-use crate::conversation_store::{db_warn, short_name, ConversationStore};
 pub use crate::conversation_store::{Conversation, DisplayMessage, Quote};
+use crate::conversation_store::{ConversationStore, db_warn, short_name};
 use crate::db::Database;
 use crate::domain::{
     ActionMenuState, ContactsOverlayState, EmojiPickerAction, EmojiPickerSource, EmojiPickerState,
@@ -21,9 +29,9 @@ use crate::domain::{
 };
 use crate::image_render;
 use crate::image_render::ImageProtocol;
-use crate::input::{self, InputAction, COMMANDS};
+use crate::input::{self, COMMANDS, InputAction};
 use crate::keybindings::{self, BindingMode, KeyAction, KeyBindings};
-use crate::list_overlay::{self, classify_list_key, ListKeyAction};
+use crate::list_overlay::{self, ListKeyAction, classify_list_key};
 use crate::mute::MuteState;
 use crate::signal::types::{
     Contact, Group, IdentityInfo, Mention, MessageStatus, PollData, PollOption, PollVote, Reaction,
@@ -67,6 +75,17 @@ fn floor_char_boundary(buf: &str, pos: usize) -> usize {
     p
 }
 
+/// Wire-protocol quote fields needed only for DB persistence.
+///
+/// `DisplayMessage.quote` holds the resolved author display name, which differs
+/// from the phone-number/UUID we persist in the DB for cross-session recovery.
+#[derive(Default)]
+pub struct WireQuote {
+    pub author: Option<String>,
+    pub body: Option<String>,
+    pub timestamp: Option<i64>,
+}
+
 impl App {
     /// Like `db_warn` but also surfaces the error in the status bar so the user sees it.
     fn db_warn_visible<T>(&mut self, result: Result<T, impl std::fmt::Display>, context: &str) {
@@ -74,6 +93,106 @@ impl App {
             crate::debug_log::logf(format_args!("db {context}: {e}"));
             self.status_message = format!("DB error ({context}): {e}");
         }
+    }
+
+    /// Common hook for all message insertions. Handles the side effects shared
+    /// by the incoming, local-send, poll, and system-message paths:
+    /// - Inserts into the conversation store (ordered by timestamp or appended)
+    /// - Bumps `last_read_index` if the insert came before the read marker
+    /// - Increments `expiring_msg_count` when the message has a disappearing timer
+    /// - Persists to the database
+    /// - Moves the conversation to the top of the sidebar (refreshing the filter
+    ///   if one is active)
+    ///
+    /// Path-specific side effects (unread counter, notifications, read receipts,
+    /// scroll/focus reset) remain at the call sites; see issue #209 for further
+    /// unification.
+    ///
+    /// Returns the index where the message was placed, or `None` if the
+    /// conversation no longer exists.
+    pub(crate) fn on_message_added(
+        &mut self,
+        conv_id: &str,
+        msg: DisplayMessage,
+        wire_quote: WireQuote,
+        ordered_insert: bool,
+    ) -> Option<usize> {
+        // Snapshot the fields we need for DB persistence before the message moves.
+        let ts_rfc3339 = msg.timestamp.to_rfc3339();
+        let sender = msg.sender.clone();
+        let sender_id = msg.sender_id.clone();
+        let body = msg.body.clone();
+        let is_system = msg.is_system;
+        let status = msg.status;
+        let timestamp_ms = msg.timestamp_ms;
+        let expires_in_seconds = msg.expires_in_seconds;
+        let expiration_start_ms = msg.expiration_start_ms;
+
+        // Insert into the in-memory store.
+        let insert_idx = {
+            let conv = self.store.conversations.get_mut(conv_id)?;
+            let pos = if ordered_insert {
+                conv.messages
+                    .partition_point(|m| m.timestamp_ms <= timestamp_ms)
+            } else {
+                conv.messages.len()
+            };
+            conv.messages.insert(pos, msg);
+            pos
+        };
+
+        // Bump the read marker when an ordered insert lands before it.
+        if ordered_insert
+            && let Some(read_idx) = self.store.last_read_index.get_mut(conv_id)
+            && insert_idx <= *read_idx
+        {
+            *read_idx += 1;
+        }
+
+        if expires_in_seconds > 0 {
+            self.expiring_msg_count += 1;
+        }
+
+        // DB persist.
+        let db_result = if is_system {
+            self.db.insert_message(
+                conv_id,
+                &sender,
+                &ts_rfc3339,
+                &body,
+                true,
+                status,
+                timestamp_ms,
+            )
+        } else {
+            self.db.insert_message_full(
+                conv_id,
+                &sender,
+                &ts_rfc3339,
+                &body,
+                false,
+                status,
+                timestamp_ms,
+                &sender_id,
+                wire_quote.author.as_deref(),
+                wire_quote.body.as_deref(),
+                wire_quote.timestamp,
+                expires_in_seconds,
+                expiration_start_ms,
+            )
+        };
+        self.db_warn_visible(db_result, "on_message_added");
+
+        // Sidebar reorder (skip for system messages, which shouldn't bump
+        // conversations to the top just because someone changed the group name).
+        if !is_system
+            && self.store.move_conversation_to_top(conv_id)
+            && self.is_overlay(OverlayKind::SidebarFilter)
+        {
+            self.refresh_sidebar_filter();
+        }
+
+        Some(insert_idx)
     }
 }
 
@@ -119,6 +238,39 @@ fn show_desktop_notification(
             .timeout(notify_rust::Timeout::Milliseconds(5000))
             .show();
     });
+}
+
+/// Tag identifying which overlay is currently active.
+///
+/// Stored on `App.current_overlay` as the single source of truth for overlay
+/// visibility. Adding a new overlay requires adding a variant here and
+/// handling it in `App::handle_overlay_key`, which the compiler enforces
+/// via the exhaustive match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayKind {
+    SidebarFilter,
+    PollVote,
+    PinDuration,
+    ActionMenu,
+    DeleteConfirm,
+    FilePicker,
+    EmojiPicker,
+    ReactionPicker,
+    MessageRequest,
+    GroupMenu,
+    About,
+    Profile,
+    Help,
+    Verify,
+    Forward,
+    Contacts,
+    Search,
+    SettingsProfiles,
+    ThemePicker,
+    Keybindings,
+    Customize,
+    Settings,
+    Autocomplete,
 }
 
 /// An image visible on screen, for native protocol overlay rendering.
@@ -263,14 +415,11 @@ pub struct App {
     /// Pending quit confirmation (unsent text in input buffer)
     pub quit_confirm: bool,
     /// Our own account number for identifying outgoing messages
-    #[allow(dead_code)]
     pub account: String,
     /// Resizable sidebar width (min 14, max 40)
     pub sidebar_width: u16,
     /// Display sidebar on the right side instead of left
     pub sidebar_on_right: bool,
-    /// Sidebar filter mode active
-    pub sidebar_filter_active: bool,
     /// Current filter text for sidebar
     pub sidebar_filter: String,
     /// Filtered conversation IDs matching the filter
@@ -299,16 +448,10 @@ pub struct App {
     pub blocked_conversations: HashSet<String>,
     /// Autocomplete popup state: candidates, selection, pending mentions.
     pub autocomplete: AutocompleteState,
-    /// Settings overlay visible
-    pub show_settings: bool,
     /// Cursor position in settings list
     pub settings_index: usize,
-    /// Customize sub-menu overlay visible (Theme, Keybindings, Profile)
-    pub show_customize: bool,
     /// Cursor position in customize sub-menu
     pub customize_index: usize,
-    /// Help overlay visible
-    pub show_help: bool,
     /// State for the contacts list overlay
     pub contacts_overlay: ContactsOverlayState,
     /// State for the identity verification overlay
@@ -367,8 +510,6 @@ pub struct App {
     pub pending_paste_cleanups: HashMap<String, (PathBuf, Instant)>,
     /// Reply target: (author_phone, body_snippet, timestamp_ms)
     pub reply_target: Option<(String, String, i64)>,
-    /// Delete confirmation overlay visible
-    pub show_delete_confirm: bool,
     /// Message being edited: (timestamp_ms, conv_id)
     pub editing_message: Option<(i64, String)>,
     /// Search overlay state
@@ -385,8 +526,6 @@ pub struct App {
     pub forward: ForwardOverlayState,
     /// Group management menu overlay state
     pub group_menu: GroupMenuOverlayState,
-    /// Message request overlay visible
-    pub show_message_request: bool,
     /// Inner area of sidebar List widget (None when sidebar is hidden)
     pub mouse_sidebar_inner: Option<Rect>,
     /// Inner area of messages block
@@ -413,8 +552,6 @@ pub struct App {
     pub poll_vote: PollVoteOverlayState,
     /// Number of in-memory messages with expiration > 0 (skip sweeps when zero)
     pub expiring_msg_count: usize,
-    /// About overlay visible
-    pub show_about: bool,
     /// Profile editor overlay state
     pub profile: ProfileOverlayState,
     /// Settings profile overlay state
@@ -423,6 +560,14 @@ pub struct App {
     pub settings_mouse_snapshot: bool,
     /// Sync state: tracks the initial message burst on startup.
     pub sync: SyncState,
+    /// Currently active overlay, when one is open.
+    ///
+    /// Single source of truth for overlay visibility. Drive all writes
+    /// through `open_overlay`/`close_overlay`/`try_open_overlay` so callers
+    /// can't accidentally bypass the dispatch layer. Per-overlay state
+    /// (filter text, cursor index, candidate lists) lives on the per-overlay
+    /// state structs and persists across close/reopen.
+    pub current_overlay: Option<OverlayKind>,
 }
 
 pub const QUICK_REACTIONS: &[&str] = &[
@@ -786,30 +931,29 @@ impl App {
                 result.timestamp_ms,
                 result.is_preview,
             ));
-            if let Some(conv) = self.store.conversations.get_mut(&result.conv_id) {
-                if let Some(idx) = conv.find_msg_idx(result.timestamp_ms) {
-                    if result.is_preview {
-                        // Store empty vec on None to prevent infinite retry for broken images
-                        conv.messages[idx].preview_image_lines =
-                            Some(result.lines.unwrap_or_default());
-                        if let Some(p) = result.image_path {
-                            conv.messages[idx].preview_image_path = Some(p);
-                        }
-                    } else {
-                        conv.messages[idx].image_lines = Some(result.lines.unwrap_or_default());
+            if let Some(conv) = self.store.conversations.get_mut(&result.conv_id)
+                && let Some(idx) = conv.find_msg_idx(result.timestamp_ms)
+            {
+                if result.is_preview {
+                    // Store empty vec on None to prevent infinite retry for broken images
+                    conv.messages[idx].preview_image_lines = Some(result.lines.unwrap_or_default());
+                    if let Some(p) = result.image_path {
+                        conv.messages[idx].preview_image_path = Some(p);
                     }
-                    // Pre-populate native image caches from background task
-                    if let Some((path, b64, pw, ph)) = result.pre_native_png {
-                        self.image
-                            .native_image_cache
-                            .entry(path)
-                            .or_insert((b64, pw, ph));
-                    }
-                    if let Some((path, sixel)) = result.pre_sixel {
-                        self.image.sixel_cache.entry(path).or_insert(sixel);
-                    }
-                    drained = true;
+                } else {
+                    conv.messages[idx].image_lines = Some(result.lines.unwrap_or_default());
                 }
+                // Pre-populate native image caches from background task
+                if let Some((path, b64, pw, ph)) = result.pre_native_png {
+                    self.image
+                        .native_image_cache
+                        .entry(path)
+                        .or_insert((b64, pw, ph));
+                }
+                if let Some((path, sixel)) = result.pre_sixel {
+                    self.image.sixel_cache.entry(path).or_insert(sixel);
+                }
+                drained = true;
             }
         }
 
@@ -838,22 +982,23 @@ impl App {
             if self.image.image_render_in_flight.len() + work.len() >= 4 {
                 break;
             }
-            if msg.body.starts_with("[image:") && msg.image_lines.is_none() {
-                if let Some(ref p) = msg.image_path {
-                    let key = (id.clone(), msg.timestamp_ms, false);
-                    if !self.image.image_render_in_flight.contains(&key) {
-                        work.push((msg.timestamp_ms, p.clone(), 40, false));
-                    }
+            if msg.body.starts_with("[image:")
+                && msg.image_lines.is_none()
+                && let Some(ref p) = msg.image_path
+            {
+                let key = (id.clone(), msg.timestamp_ms, false);
+                if !self.image.image_render_in_flight.contains(&key) {
+                    work.push((msg.timestamp_ms, p.clone(), 40, false));
                 }
             }
-            if self.image.show_link_previews && msg.preview_image_lines.is_none() {
-                if let Some(ref preview) = msg.preview {
-                    if let Some(ref p) = preview.image_path {
-                        let key = (id.clone(), msg.timestamp_ms, true);
-                        if !self.image.image_render_in_flight.contains(&key) {
-                            work.push((msg.timestamp_ms, p.clone(), 30, true));
-                        }
-                    }
+            if self.image.show_link_previews
+                && msg.preview_image_lines.is_none()
+                && let Some(ref preview) = msg.preview
+                && let Some(ref p) = preview.image_path
+            {
+                let key = (id.clone(), msg.timestamp_ms, true);
+                if !self.image.image_render_in_flight.contains(&key) {
+                    work.push((msg.timestamp_ms, p.clone(), 30, true));
                 }
             }
         }
@@ -956,14 +1101,14 @@ impl App {
                         _ => "native".to_string(),
                     };
                 } else if self.settings_index == customize_index {
-                    self.show_customize = true;
+                    self.open_overlay(OverlayKind::Customize);
                     self.customize_index = 0;
                 } else {
                     self.toggle_setting(self.settings_index);
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.show_settings = false;
+                self.close_overlay();
                 self.save_settings();
                 self.fire_deferred_settings_hooks();
             }
@@ -982,12 +1127,11 @@ impl App {
                 self.customize_index = self.customize_index.saturating_sub(1);
             }
             KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Tab => {
-                self.show_customize = false;
-                self.show_settings = false;
+                self.close_overlay();
                 self.save_settings();
                 match self.customize_index {
                     0 => {
-                        self.theme_picker.show = true;
+                        self.open_overlay(OverlayKind::ThemePicker);
                         self.theme_picker.index = self
                             .theme_picker
                             .available_themes
@@ -996,7 +1140,7 @@ impl App {
                             .unwrap_or(0);
                     }
                     1 => {
-                        self.keybindings_overlay.show = true;
+                        self.open_overlay(OverlayKind::Keybindings);
                         self.keybindings_overlay.index = 0;
                     }
                     2 => {
@@ -1006,7 +1150,7 @@ impl App {
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.show_customize = false;
+                self.close_overlay();
             }
             _ => {}
         }
@@ -1038,7 +1182,7 @@ impl App {
             .iter()
             .position(|p| p.name == self.settings_profiles.name)
             .unwrap_or(0);
-        self.settings_profiles.show = true;
+        self.open_overlay(OverlayKind::SettingsProfiles);
         self.settings_profiles.save_as = false;
         self.settings_profiles.save_as_input.clear();
         // Don't overwrite settings_snapshot - keep the one from when /settings opened
@@ -1200,7 +1344,7 @@ impl App {
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.settings_profiles.show = false;
+                self.close_overlay();
                 self.fire_deferred_settings_hooks();
             }
             _ => {}
@@ -1234,10 +1378,10 @@ impl App {
                     self.theme = selected.clone();
                     self.save_settings();
                 }
-                self.theme_picker.show = false;
+                self.close_overlay();
             }
             ListKeyAction::Close => {
-                self.theme_picker.show = false;
+                self.close_overlay();
             }
             _ => {}
         }
@@ -1362,7 +1506,7 @@ impl App {
                 }
             }
             KeyCode::Esc | KeyCode::Char('q') => {
-                self.keybindings_overlay.show = false;
+                self.close_overlay();
                 self.save_settings();
             }
             _ => {}
@@ -1393,16 +1537,16 @@ impl App {
         let displaced = self.keybindings.rebind(mode, action, combo.clone());
         self.keybindings_overlay.capturing = false;
 
-        if let Some(displaced_action) = displaced {
-            if displaced_action != action {
-                self.status_message = format!(
-                    "'{}' was bound to {}. Accept? (y/n)",
-                    keybindings::format_key_combo(&combo),
-                    keybindings::action_label(displaced_action)
-                );
-                self.keybindings_overlay.conflict = Some((displaced_action, combo));
-                return;
-            }
+        if let Some(displaced_action) = displaced
+            && displaced_action != action
+        {
+            self.status_message = format!(
+                "'{}' was bound to {}. Accept? (y/n)",
+                keybindings::format_key_combo(&combo),
+                keybindings::action_label(displaced_action)
+            );
+            self.keybindings_overlay.conflict = Some((displaced_action, combo));
+            return;
         }
         self.status_message = format!(
             "{} → {}",
@@ -1644,6 +1788,7 @@ impl App {
                     }
                     KeyCode::Esc => {
                         self.group_menu.state = None;
+                        self.close_overlay();
                     }
                     _ => {}
                 }
@@ -1661,6 +1806,7 @@ impl App {
                         self.group_menu.index = self.group_menu.index.saturating_sub(1);
                     }
                     KeyCode::Esc => {
+                        self.open_overlay(OverlayKind::GroupMenu);
                         self.group_menu.state = Some(GroupMenuState::Menu);
                         self.group_menu.index = 0;
                     }
@@ -1686,6 +1832,7 @@ impl App {
                             let phone = phone.clone();
                             let group_id = self.active_conversation.clone()?;
                             self.group_menu.state = None;
+                            self.close_overlay();
                             self.group_menu.filter.clear();
                             return Some(SendRequest::AddGroupMembers {
                                 group_id,
@@ -1694,6 +1841,7 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
+                        self.open_overlay(OverlayKind::GroupMenu);
                         self.group_menu.state = Some(GroupMenuState::Menu);
                         self.group_menu.index = 0;
                         self.group_menu.filter.clear();
@@ -1730,6 +1878,7 @@ impl App {
                             let phone = phone.clone();
                             let group_id = self.active_conversation.clone()?;
                             self.group_menu.state = None;
+                            self.close_overlay();
                             self.group_menu.filter.clear();
                             return Some(SendRequest::RemoveGroupMembers {
                                 group_id,
@@ -1738,6 +1887,7 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
+                        self.open_overlay(OverlayKind::GroupMenu);
                         self.group_menu.state = Some(GroupMenuState::Menu);
                         self.group_menu.index = 0;
                         self.group_menu.filter.clear();
@@ -1763,11 +1913,13 @@ impl App {
                         if !name.is_empty() {
                             let group_id = self.active_conversation.clone()?;
                             self.group_menu.state = None;
+                            self.close_overlay();
                             self.group_menu.input.clear();
                             return Some(SendRequest::RenameGroup { group_id, name });
                         }
                     }
                     KeyCode::Esc => {
+                        self.open_overlay(OverlayKind::GroupMenu);
                         self.group_menu.state = Some(GroupMenuState::Menu);
                         self.group_menu.index = 0;
                         self.group_menu.input.clear();
@@ -1788,12 +1940,14 @@ impl App {
                         let name = self.group_menu.input.trim().to_string();
                         if !name.is_empty() {
                             self.group_menu.state = None;
+                            self.close_overlay();
                             self.group_menu.input.clear();
                             return Some(SendRequest::CreateGroup { name });
                         }
                     }
                     KeyCode::Esc => {
                         self.group_menu.state = None;
+                        self.close_overlay();
                         self.group_menu.input.clear();
                     }
                     KeyCode::Backspace => {
@@ -1811,9 +1965,11 @@ impl App {
                     KeyCode::Char('y') => {
                         let group_id = self.active_conversation.clone()?;
                         self.group_menu.state = None;
+                        self.close_overlay();
                         return Some(SendRequest::LeaveGroup { group_id });
                     }
                     KeyCode::Char('n') | KeyCode::Esc => {
+                        self.open_overlay(OverlayKind::GroupMenu);
                         self.group_menu.state = Some(GroupMenuState::Menu);
                         self.group_menu.index = 0;
                     }
@@ -1852,14 +2008,17 @@ impl App {
                     })
                     .unwrap_or_default();
                 self.group_menu.filtered = members;
+                self.open_overlay(OverlayKind::GroupMenu);
                 self.group_menu.state = Some(GroupMenuState::Members);
             }
             "a" => {
                 self.refresh_group_add_filter();
+                self.open_overlay(OverlayKind::GroupMenu);
                 self.group_menu.state = Some(GroupMenuState::AddMember);
             }
             "r" => {
                 self.refresh_group_remove_filter();
+                self.open_overlay(OverlayKind::GroupMenu);
                 self.group_menu.state = Some(GroupMenuState::RemoveMember);
             }
             "n" => {
@@ -1871,12 +2030,15 @@ impl App {
                     .map(|c| c.name.clone())
                     .unwrap_or_default();
                 self.group_menu.input = name;
+                self.open_overlay(OverlayKind::GroupMenu);
                 self.group_menu.state = Some(GroupMenuState::Rename);
             }
             "l" => {
+                self.open_overlay(OverlayKind::GroupMenu);
                 self.group_menu.state = Some(GroupMenuState::LeaveConfirm);
             }
             "c" => {
+                self.open_overlay(OverlayKind::GroupMenu);
                 self.group_menu.state = Some(GroupMenuState::Create);
             }
             _ => {}
@@ -1888,7 +2050,7 @@ impl App {
         let conv_id = match self.active_conversation.clone() {
             Some(id) => id,
             None => {
-                self.show_message_request = false;
+                self.close_overlay();
                 return None;
             }
         };
@@ -1904,7 +2066,7 @@ impl App {
                     conv.accepted = true;
                 }
                 self.db_warn_visible(self.db.update_accepted(&conv_id, true), "update_accepted");
-                self.show_message_request = false;
+                self.close_overlay();
                 Some(SendRequest::MessageRequestResponse {
                     recipient: conv_id,
                     is_group,
@@ -1922,7 +2084,7 @@ impl App {
                 self.store.conversation_order.retain(|id| id != &conv_id);
                 self.scroll_positions.remove(&conv_id);
                 self.db_warn_visible(self.db.delete_conversation(&conv_id), "delete_conversation");
-                self.show_message_request = false;
+                self.close_overlay();
                 self.active_conversation = None;
                 Some(SendRequest::MessageRequestResponse {
                     recipient: conv_id,
@@ -1931,7 +2093,7 @@ impl App {
                 })
             }
             KeyCode::Esc => {
-                self.show_message_request = false;
+                self.close_overlay();
                 self.active_conversation = None;
                 None
             }
@@ -1955,24 +2117,24 @@ impl App {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < QUICK_REACTIONS.len() {
                     self.reactions.picker_index = idx;
-                    self.reactions.show_picker = false;
+                    self.close_overlay();
                     self.prepare_reaction_send()
                 } else {
                     None
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.reactions.show_picker = false;
+                self.close_overlay();
                 self.prepare_reaction_send()
             }
             KeyCode::Char('e') | KeyCode::Char('/') => {
                 // Open full emoji picker from reaction context
-                self.reactions.show_picker = false;
                 self.emoji_picker.open(EmojiPickerSource::Reaction, None);
+                self.open_overlay(OverlayKind::EmojiPicker);
                 None
             }
             KeyCode::Esc => {
-                self.reactions.show_picker = false;
+                self.close_overlay();
                 None
             }
             _ => None,
@@ -2020,21 +2182,21 @@ impl App {
             .any(|r| r.sender == "you" && r.emoji == emoji);
 
         // Optimistic local update
-        if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-            if let Some(msg) = conv.messages.get_mut(index) {
-                if is_remove {
-                    msg.reactions
-                        .retain(|r| !(r.sender == "you" && r.emoji == emoji));
+        if let Some(conv) = self.store.conversations.get_mut(&conv_id)
+            && let Some(msg) = conv.messages.get_mut(index)
+        {
+            if is_remove {
+                msg.reactions
+                    .retain(|r| !(r.sender == "you" && r.emoji == emoji));
+            } else {
+                // One reaction per user — replace or push
+                if let Some(existing) = msg.reactions.iter_mut().find(|r| r.sender == "you") {
+                    existing.emoji = emoji.to_string();
                 } else {
-                    // One reaction per user — replace or push
-                    if let Some(existing) = msg.reactions.iter_mut().find(|r| r.sender == "you") {
-                        existing.emoji = emoji.to_string();
-                    } else {
-                        msg.reactions.push(Reaction {
-                            emoji: emoji.to_string(),
-                            sender: "you".to_string(),
-                        });
-                    }
+                    msg.reactions.push(Reaction {
+                        emoji: emoji.to_string(),
+                        sender: "you".to_string(),
+                    });
                 }
             }
         }
@@ -2157,7 +2319,7 @@ impl App {
     pub fn handle_action_menu_key(&mut self, code: KeyCode) -> Option<SendRequest> {
         let item_count = self.action_menu_items().len();
         if item_count == 0 {
-            self.action_menu.show = false;
+            self.close_overlay();
             return None;
         }
         match classify_list_key(code, false) {
@@ -2175,15 +2337,15 @@ impl App {
                 let items = self.action_menu_items();
                 if let Some(action) = items.get(self.action_menu.index) {
                     let hint = action.key_hint;
-                    self.action_menu.show = false;
+                    self.close_overlay();
                     self.execute_action_by_hint(hint)
                 } else {
-                    self.action_menu.show = false;
+                    self.close_overlay();
                     None
                 }
             }
             ListKeyAction::Close => {
-                self.action_menu.show = false;
+                self.close_overlay();
                 None
             }
             ListKeyAction::None => {
@@ -2206,7 +2368,7 @@ impl App {
                     // Only execute if this action is available in the menu
                     let items = self.action_menu_items();
                     if items.iter().any(|a| a.key_hint == hint) {
-                        self.action_menu.show = false;
+                        self.close_overlay();
                         self.execute_action_by_hint(hint)
                     } else {
                         None
@@ -2225,39 +2387,42 @@ impl App {
         match hint {
             "q" => {
                 // Reply — same as Normal 'q'
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        let author_phone = msg.sender_id.clone();
-                        let snippet: String = if msg.body.chars().count() > 50 {
-                            format!("{}…", msg.body.chars().take(50).collect::<String>())
-                        } else {
-                            msg.body.clone()
-                        };
-                        let ts = msg.timestamp_ms;
-                        let phone = if author_phone.is_empty() || author_phone == "you" {
-                            self.account.clone()
-                        } else {
-                            author_phone
-                        };
-                        self.reply_target = Some((phone, snippet, ts));
-                        self.mode = InputMode::Insert;
-                    }
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    let author_phone = msg.sender_id.clone();
+                    let snippet: String = if msg.body.chars().count() > 50 {
+                        format!("{}…", msg.body.chars().take(50).collect::<String>())
+                    } else {
+                        msg.body.clone()
+                    };
+                    let ts = msg.timestamp_ms;
+                    let phone = if author_phone.is_empty() || author_phone == "you" {
+                        self.account.clone()
+                    } else {
+                        author_phone
+                    };
+                    self.reply_target = Some((phone, snippet, ts));
+                    self.mode = InputMode::Insert;
                 }
                 None
             }
             "e" => {
                 // Edit — same as Normal 'e'
-                if let Some(msg) = self.selected_message() {
-                    if msg.sender == "you" && !msg.is_deleted && !msg.is_system {
-                        let ts = msg.timestamp_ms;
-                        let body = msg.body.clone();
-                        if let Some(ref conv_id) = self.active_conversation {
-                            let conv_id = conv_id.clone();
-                            self.editing_message = Some((ts, conv_id));
-                            self.input_buffer = body;
-                            self.input_cursor = self.input_buffer.len();
-                            self.mode = InputMode::Insert;
-                        }
+                if let Some(msg) = self.selected_message()
+                    && msg.sender == "you"
+                    && !msg.is_deleted
+                    && !msg.is_system
+                {
+                    let ts = msg.timestamp_ms;
+                    let body = msg.body.clone();
+                    if let Some(ref conv_id) = self.active_conversation {
+                        let conv_id = conv_id.clone();
+                        self.editing_message = Some((ts, conv_id));
+                        self.input_buffer = body;
+                        self.input_cursor = self.input_buffer.len();
+                        self.mode = InputMode::Insert;
                     }
                 }
                 None
@@ -2265,18 +2430,19 @@ impl App {
             "r" => {
                 // React — open reaction picker
                 if self.selected_message().is_some_and(|m| !m.is_system) {
-                    self.reactions.show_picker = true;
+                    self.open_overlay(OverlayKind::ReactionPicker);
                     self.reactions.picker_index = 0;
                 }
                 None
             }
             "f" => {
                 // Forward — open conversation picker
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        self.forward.body = msg.body.clone();
-                        self.open_forward_picker();
-                    }
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    self.forward.body = msg.body.clone();
+                    self.open_forward_picker();
                 }
                 None
             }
@@ -2287,10 +2453,11 @@ impl App {
             }
             "d" => {
                 // Delete — open delete confirm
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        self.show_delete_confirm = true;
-                    }
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    self.open_overlay(OverlayKind::DeleteConfirm);
                 }
                 None
             }
@@ -2300,90 +2467,88 @@ impl App {
             }
             "v" => {
                 // Vote on poll
-                if let Some(msg) = self.selected_message() {
-                    if let Some(ref poll) = msg.poll_data {
-                        if !poll.closed {
-                            let conv_id = self.active_conversation.clone().unwrap_or_default();
-                            let is_group = self
-                                .store
-                                .conversations
-                                .get(&conv_id)
-                                .map(|c| c.is_group)
-                                .unwrap_or(false);
-                            let poll_author = if msg.sender_id.is_empty() || msg.sender_id == "you"
-                            {
-                                self.account.clone()
-                            } else {
-                                msg.sender_id.clone()
-                            };
-                            let options = poll.options.clone();
-                            let allow_multiple = poll.allow_multiple;
-                            let poll_timestamp = msg.timestamp_ms;
-                            let option_count = options.len();
-                            self.poll_vote.pending = Some(PollVotePending {
-                                conv_id,
-                                is_group,
-                                poll_author,
-                                poll_timestamp,
-                                allow_multiple,
-                                options,
-                            });
-                            self.poll_vote.selections = vec![false; option_count];
-                            self.poll_vote.index = 0;
-                            self.poll_vote.show = true;
-                        }
-                    }
+                if let Some(msg) = self.selected_message()
+                    && let Some(ref poll) = msg.poll_data
+                    && !poll.closed
+                {
+                    let conv_id = self.active_conversation.clone().unwrap_or_default();
+                    let is_group = self
+                        .store
+                        .conversations
+                        .get(&conv_id)
+                        .map(|c| c.is_group)
+                        .unwrap_or(false);
+                    let poll_author = if msg.sender_id.is_empty() || msg.sender_id == "you" {
+                        self.account.clone()
+                    } else {
+                        msg.sender_id.clone()
+                    };
+                    let options = poll.options.clone();
+                    let allow_multiple = poll.allow_multiple;
+                    let poll_timestamp = msg.timestamp_ms;
+                    let option_count = options.len();
+                    self.poll_vote.pending = Some(PollVotePending {
+                        conv_id,
+                        is_group,
+                        poll_author,
+                        poll_timestamp,
+                        allow_multiple,
+                        options,
+                    });
+                    self.poll_vote.selections = vec![false; option_count];
+                    self.poll_vote.index = 0;
+                    self.open_overlay(OverlayKind::PollVote);
                 }
                 None
             }
             "x" => {
                 // End poll
-                if let Some(msg) = self.selected_message() {
-                    if msg.sender == "you" && msg.poll_data.as_ref().is_some_and(|p| !p.closed) {
-                        let conv_id = self.active_conversation.clone()?;
-                        let is_group = self
-                            .store
-                            .conversations
-                            .get(&conv_id)
-                            .map(|c| c.is_group)
-                            .unwrap_or(false);
-                        let poll_timestamp = msg.timestamp_ms;
-                        // Optimistic close
-                        if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-                            if let Some(idx) = conv.find_msg_idx(poll_timestamp) {
-                                if let Some(ref mut poll) = conv.messages[idx].poll_data {
-                                    poll.closed = true;
-                                }
-                            }
-                        }
-                        self.db_warn_visible(
-                            self.db.close_poll(&conv_id, poll_timestamp),
-                            "close_poll",
-                        );
-                        return Some(SendRequest::PollTerminate {
-                            recipient: conv_id,
-                            is_group,
-                            poll_timestamp,
-                        });
+                if let Some(msg) = self.selected_message()
+                    && msg.sender == "you"
+                    && msg.poll_data.as_ref().is_some_and(|p| !p.closed)
+                {
+                    let conv_id = self.active_conversation.clone()?;
+                    let is_group = self
+                        .store
+                        .conversations
+                        .get(&conv_id)
+                        .map(|c| c.is_group)
+                        .unwrap_or(false);
+                    let poll_timestamp = msg.timestamp_ms;
+                    // Optimistic close
+                    if let Some(conv) = self.store.conversations.get_mut(&conv_id)
+                        && let Some(idx) = conv.find_msg_idx(poll_timestamp)
+                        && let Some(ref mut poll) = conv.messages[idx].poll_data
+                    {
+                        poll.closed = true;
                     }
+                    self.db_warn_visible(
+                        self.db.close_poll(&conv_id, poll_timestamp),
+                        "close_poll",
+                    );
+                    return Some(SendRequest::PollTerminate {
+                        recipient: conv_id,
+                        is_group,
+                        poll_timestamp,
+                    });
                 }
                 None
             }
             "o" => {
                 // Open attachment
-                if let Some(msg) = self.selected_message() {
-                    if let Some(uri) = extract_file_uri(&msg.body) {
-                        self.open_file(&uri);
-                    }
+                if let Some(msg) = self.selected_message()
+                    && let Some(uri) = extract_file_uri(&msg.body)
+                {
+                    self.open_file(&uri);
                 }
                 None
             }
             "l" => {
                 // Open link
-                if let Some(msg) = self.selected_message() {
-                    if let Some(url) = extract_http_url(&msg.body) {
-                        self.open_url(&url);
-                    }
+                if let Some(msg) = self.selected_message()
+                    && let Some(url) = extract_http_url(&msg.body)
+                {
+                    self.open_url(&url);
                 }
                 None
             }
@@ -2434,7 +2599,7 @@ impl App {
             }
             KeyCode::Esc => {
                 self.verify.confirming = false;
-                self.verify.show = false;
+                self.close_overlay();
             }
             _ => {
                 self.verify.confirming = false;
@@ -2444,7 +2609,7 @@ impl App {
     }
 
     fn open_forward_picker(&mut self) {
-        self.forward.show = true;
+        self.open_overlay(OverlayKind::Forward);
         self.forward.index = 0;
         self.forward.filter.clear();
         self.update_forward_filter();
@@ -2500,11 +2665,9 @@ impl App {
                         .unwrap_or(false);
                     let body = format!("[Forwarded]\n{}", self.forward.body);
                     let local_ts_ms = chrono::Utc::now().timestamp_millis();
-                    self.forward.show = false;
+                    self.close_overlay();
                     self.status_message = format!("Forwarded to {name}");
-                    if self.store.move_conversation_to_top(&conv_id) && self.sidebar_filter_active {
-                        self.refresh_sidebar_filter();
-                    }
+                    self.store.move_conversation_to_top(&conv_id);
                     return Some(SendRequest::Message {
                         recipient: conv_id,
                         body,
@@ -2519,7 +2682,7 @@ impl App {
                 }
             }
             ListKeyAction::Close => {
-                self.forward.show = false;
+                self.close_overlay();
             }
             ListKeyAction::FilterPush(c) => {
                 if !c.is_control() {
@@ -2555,13 +2718,13 @@ impl App {
                     .get(self.contacts_overlay.index)
                 {
                     let number = number.clone();
-                    self.contacts_overlay.show = false;
+                    self.close_overlay();
                     self.contacts_overlay.filter.clear();
                     self.join_conversation(&number);
                 }
             }
             ListKeyAction::Close => {
-                self.contacts_overlay.show = false;
+                self.close_overlay();
                 self.contacts_overlay.filter.clear();
             }
             ListKeyAction::FilterPush(c) => {
@@ -2672,6 +2835,7 @@ impl App {
                 timestamp_ms,
                 status,
             } => {
+                self.close_overlay();
                 self.join_conversation(&conv_id);
                 self.jump_to_message_timestamp(timestamp_ms);
                 if let Some(msg) = status {
@@ -2680,6 +2844,9 @@ impl App {
             }
             SearchAction::Status(msg) => {
                 self.status_message = msg;
+            }
+            SearchAction::Cancel => {
+                self.close_overlay();
             }
             SearchAction::None => {}
         }
@@ -2692,12 +2859,20 @@ impl App {
             return;
         }
         self.file_picker.open();
+        self.open_overlay(OverlayKind::FilePicker);
     }
 
     /// Handle a key press while the file browser overlay is open.
     pub fn handle_file_browser_key(&mut self, code: KeyCode) {
-        if let Some(path) = self.file_picker.handle_key(code) {
-            self.pending_attachment = Some(path);
+        match self.file_picker.handle_key(code) {
+            crate::domain::FilePickerOutcome::Continue => {}
+            crate::domain::FilePickerOutcome::Selected(path) => {
+                self.pending_attachment = Some(path);
+                self.close_overlay();
+            }
+            crate::domain::FilePickerOutcome::Cancelled => {
+                self.close_overlay();
+            }
         }
     }
 
@@ -2726,6 +2901,9 @@ impl App {
             }
             KeyCode::Esc => {
                 self.autocomplete.clear();
+                if self.is_overlay(OverlayKind::Autocomplete) {
+                    self.close_overlay();
+                }
             }
             KeyCode::Enter => {
                 if self.autocomplete.mode == AutocompleteMode::Mention {
@@ -2764,7 +2942,6 @@ impl App {
             account,
             sidebar_width: 22,
             sidebar_on_right: false,
-            sidebar_filter_active: false,
             sidebar_filter: String::new(),
             sidebar_filtered: Vec::new(),
             typing: TypingState::default(),
@@ -2779,11 +2956,8 @@ impl App {
             muted_conversations: HashMap::new(),
             blocked_conversations: HashSet::new(),
             autocomplete: AutocompleteState::new(),
-            show_settings: false,
             settings_index: 0,
-            show_customize: false,
             customize_index: 0,
-            show_help: false,
             contacts_overlay: ContactsOverlayState::default(),
             verify: VerifyOverlayState::default(),
             identity_trust: HashMap::new(),
@@ -2824,7 +2998,6 @@ impl App {
                 dir
             },
             reply_target: None,
-            show_delete_confirm: false,
             editing_message: None,
             search: SearchState::default(),
             pending_typing_stop: None,
@@ -2833,7 +3006,6 @@ impl App {
             action_menu: ActionMenuState::default(),
             forward: ForwardOverlayState::default(),
             group_menu: GroupMenuOverlayState::default(),
-            show_message_request: false,
             mouse_sidebar_inner: None,
             mouse_messages_area: Rect::default(),
             mouse_input_area: Rect::default(),
@@ -2853,7 +3025,6 @@ impl App {
             pin_duration: PinDurationOverlayState::default(),
             poll_vote: PollVoteOverlayState::default(),
             expiring_msg_count: 0,
-            show_about: false,
             profile: ProfileOverlayState::default(),
             settings_profiles: SettingsProfileOverlayState {
                 available: crate::settings_profile::all_settings_profiles(),
@@ -2861,6 +3032,7 @@ impl App {
             },
             settings_mouse_snapshot: true,
             sync: SyncState::new(),
+            current_overlay: None,
         }
     }
 
@@ -2896,10 +3068,10 @@ impl App {
                     } else {
                         None
                     };
-                    if let Some(p) = path_str {
-                        if Path::new(&p).exists() {
-                            msg.image_path = Some(p);
-                        }
+                    if let Some(p) = path_str
+                        && Path::new(&p).exists()
+                    {
+                        msg.image_path = Some(p);
                     }
                 }
             }
@@ -2995,10 +3167,10 @@ impl App {
                     } else {
                         None
                     };
-                    if let Some(p) = path_str {
-                        if Path::new(&p).exists() {
-                            msg.image_path = Some(p);
-                        }
+                    if let Some(p) = path_str
+                        && Path::new(&p).exists()
+                    {
+                        msg.image_path = Some(p);
                     }
                 }
                 msg
@@ -3015,10 +3187,10 @@ impl App {
         if let Some(read_idx) = self.store.last_read_index.get_mut(&conv_id) {
             *read_idx += prepend_count;
         }
-        if self.active_conversation.as_ref() == Some(&conv_id) {
-            if let Some(ref mut fi) = self.focused_msg_index {
-                *fi += prepend_count;
-            }
+        if self.active_conversation.as_ref() == Some(&conv_id)
+            && let Some(ref mut fi) = self.focused_msg_index
+        {
+            *fi += prepend_count;
         }
     }
 
@@ -3048,7 +3220,9 @@ impl App {
 
     /// Clear sidebar filter state and restore the full list.
     fn clear_sidebar_filter(&mut self) {
-        self.sidebar_filter_active = false;
+        if self.is_overlay(OverlayKind::SidebarFilter) {
+            self.close_overlay();
+        }
         self.sidebar_filter.clear();
         self.sidebar_filtered.clear();
     }
@@ -3281,7 +3455,7 @@ impl App {
                 }
                 true
             }
-            Some(KeyAction::NextConversation) if !self.autocomplete.visible => {
+            Some(KeyAction::NextConversation) if !self.is_overlay(OverlayKind::Autocomplete) => {
                 self.next_conversation();
                 true
             }
@@ -3311,7 +3485,7 @@ impl App {
             }
             Some(KeyAction::SidebarSearch) => {
                 self.sidebar_visible = true;
-                self.sidebar_filter_active = true;
+                self.open_overlay(OverlayKind::SidebarFilter);
                 self.sidebar_filter.clear();
                 self.sidebar_filtered.clear();
                 true
@@ -3324,33 +3498,75 @@ impl App {
     /// Returns `Some((recipient, body, is_group, local_ts_ms))` if an autocomplete
     /// command triggers a message send. Returns `None` otherwise.
     /// Returns `Ok(true)` if the key was consumed by an overlay.
+    /// Returns the currently-active overlay, if any.
+    ///
+    /// All 23 overlays are now backed by `current_overlay`, so this is just
+    /// a thin accessor. Both `has_overlay` and `handle_overlay_key` defer
+    /// to it so dispatch and visibility stay in sync automatically.
+    pub fn active_overlay(&self) -> Option<OverlayKind> {
+        self.current_overlay
+    }
+
+    /// Open an overlay.
+    ///
+    /// Clobbers whichever overlay was previously active. Use `try_open_overlay`
+    /// if you need to defer to an existing higher-priority overlay (e.g.
+    /// auto-open paths called from `update_status` or `update_autocomplete`).
+    pub fn open_overlay(&mut self, kind: OverlayKind) {
+        self.current_overlay = Some(kind);
+    }
+
+    /// Clear `current_overlay`.
+    pub fn close_overlay(&mut self) {
+        self.current_overlay = None;
+    }
+
+    /// Open `kind` only if no other App-owned overlay is currently active
+    /// (or if `kind` is already the active overlay). Use this for auto-open
+    /// paths that must not clobber a higher-priority overlay - e.g.
+    /// `update_autocomplete` firing on every keystroke, or `update_status`
+    /// auto-opening MessageRequest on conversation switches.
+    pub fn try_open_overlay(&mut self, kind: OverlayKind) {
+        if self.current_overlay.is_none() || self.current_overlay == Some(kind) {
+            self.open_overlay(kind);
+        }
+    }
+
+    /// Returns true if the given overlay kind is currently active.
+    pub fn is_overlay(&self, kind: OverlayKind) -> bool {
+        self.current_overlay == Some(kind)
+    }
+
     pub fn handle_overlay_key(&mut self, code: KeyCode) -> (bool, Option<SendRequest>) {
-        if self.sidebar_filter_active {
-            self.handle_sidebar_filter_key(code);
-            return (true, None);
-        }
-        if self.poll_vote.show {
-            let send = self.handle_poll_vote_key(code);
-            return (true, send);
-        }
-        if self.pin_duration.show {
-            let send = self.handle_pin_duration_key(code);
-            return (true, send);
-        }
-        if self.action_menu.show {
-            let send = self.handle_action_menu_key(code);
-            return (true, send);
-        }
-        if self.show_delete_confirm {
-            let send = self.handle_delete_confirm_key(code);
-            return (true, send);
-        }
-        if self.file_picker.visible {
-            self.handle_file_browser_key(code);
-            return (true, None);
-        }
-        if self.emoji_picker.visible {
-            match self.emoji_picker.handle_key(code) {
+        let Some(kind) = self.active_overlay() else {
+            return (false, None);
+        };
+        match kind {
+            OverlayKind::SidebarFilter => {
+                self.handle_sidebar_filter_key(code);
+                (true, None)
+            }
+            OverlayKind::PollVote => {
+                let send = self.handle_poll_vote_key(code);
+                (true, send)
+            }
+            OverlayKind::PinDuration => {
+                let send = self.handle_pin_duration_key(code);
+                (true, send)
+            }
+            OverlayKind::ActionMenu => {
+                let send = self.handle_action_menu_key(code);
+                (true, send)
+            }
+            OverlayKind::DeleteConfirm => {
+                let send = self.handle_delete_confirm_key(code);
+                (true, send)
+            }
+            OverlayKind::FilePicker => {
+                self.handle_file_browser_key(code);
+                (true, None)
+            }
+            OverlayKind::EmojiPicker => match self.emoji_picker.handle_key(code) {
                 EmojiPickerAction::Select(emoji) => {
                     let source = self.emoji_picker.source;
                     self.emoji_picker.close();
@@ -3358,11 +3574,11 @@ impl App {
                         EmojiPickerSource::Input => {
                             self.input_buffer.insert_str(self.input_cursor, &emoji);
                             self.input_cursor += emoji.len();
-                            return (true, None);
+                            (true, None)
                         }
                         EmojiPickerSource::Reaction => {
                             let send = self.prepare_reaction_send_emoji(&emoji);
-                            return (true, send);
+                            (true, send)
                         }
                     }
                 }
@@ -3370,78 +3586,77 @@ impl App {
                     let was_reaction = self.emoji_picker.source == EmojiPickerSource::Reaction;
                     self.emoji_picker.close();
                     if was_reaction {
-                        self.reactions.show_picker = true;
+                        self.open_overlay(OverlayKind::ReactionPicker);
                     }
-                    return (true, None);
+                    (true, None)
                 }
-                EmojiPickerAction::None => return (true, None),
+                EmojiPickerAction::None => (true, None),
+            },
+            OverlayKind::ReactionPicker => {
+                let send = self.handle_reaction_picker_key(code);
+                (true, send)
+            }
+            OverlayKind::MessageRequest => {
+                let send = self.handle_message_request_key(code);
+                (true, send)
+            }
+            OverlayKind::GroupMenu => {
+                let send = self.handle_group_menu_key(code);
+                (true, send)
+            }
+            OverlayKind::About => {
+                self.close_overlay();
+                (true, None)
+            }
+            OverlayKind::Profile => {
+                let send = self.handle_profile_key(code);
+                (true, send)
+            }
+            OverlayKind::Help => {
+                self.close_overlay();
+                (true, None)
+            }
+            OverlayKind::Verify => {
+                let send = self.handle_verify_key(code);
+                (true, send)
+            }
+            OverlayKind::Forward => {
+                let send = self.handle_forward_key(code);
+                (true, send)
+            }
+            OverlayKind::Contacts => {
+                self.handle_contacts_key(code);
+                (true, None)
+            }
+            OverlayKind::Search => {
+                self.handle_search_key(code);
+                (true, None)
+            }
+            OverlayKind::SettingsProfiles => {
+                self.handle_settings_profile_manager_key(code);
+                (true, None)
+            }
+            OverlayKind::ThemePicker => {
+                self.handle_theme_key(code);
+                (true, None)
+            }
+            OverlayKind::Keybindings => {
+                self.handle_keybindings_key(code);
+                (true, None)
+            }
+            OverlayKind::Customize => {
+                self.handle_customize_key(code);
+                (true, None)
+            }
+            OverlayKind::Settings => {
+                self.handle_settings_key(code);
+                (true, None)
+            }
+            OverlayKind::Autocomplete => {
+                let send = self.handle_autocomplete_key(code);
+                (true, send)
             }
         }
-        if self.reactions.show_picker {
-            let send = self.handle_reaction_picker_key(code);
-            return (true, send);
-        }
-        if self.show_message_request {
-            let send = self.handle_message_request_key(code);
-            return (true, send);
-        }
-        if self.group_menu.state.is_some() {
-            let send = self.handle_group_menu_key(code);
-            return (true, send);
-        }
-        if self.show_about {
-            self.show_about = false;
-            return (true, None);
-        }
-        if self.profile.show {
-            let send = self.handle_profile_key(code);
-            return (true, send);
-        }
-        if self.show_help {
-            self.show_help = false;
-            return (true, None);
-        }
-        if self.verify.show {
-            let send = self.handle_verify_key(code);
-            return (true, send);
-        }
-        if self.forward.show {
-            let send = self.handle_forward_key(code);
-            return (true, send);
-        }
-        if self.contacts_overlay.show {
-            self.handle_contacts_key(code);
-            return (true, None);
-        }
-        if self.search.visible {
-            self.handle_search_key(code);
-            return (true, None);
-        }
-        if self.settings_profiles.show {
-            self.handle_settings_profile_manager_key(code);
-            return (true, None);
-        }
-        if self.theme_picker.show {
-            self.handle_theme_key(code);
-            return (true, None);
-        }
-        if self.keybindings_overlay.show {
-            self.handle_keybindings_key(code);
-            return (true, None);
-        }
-        if self.show_customize {
-            self.handle_customize_key(code);
-            return (true, None);
-        }
-        if self.show_settings {
-            self.handle_settings_key(code);
-            return (true, None);
-        }
-        if self.autocomplete.visible {
-            let send = self.handle_autocomplete_key(code);
-            return (true, send);
-        }
-        (false, None)
     }
 
     /// Handle Normal mode key. Dispatches to scroll, edit, or action sub-handlers.
@@ -3455,20 +3670,21 @@ impl App {
             match (prev, code) {
                 ('g', KeyCode::Char('g')) => {
                     // gg = scroll to top
-                    if let Some(ref id) = self.active_conversation {
-                        if let Some(conv) = self.store.conversations.get(id) {
-                            self.scroll_offset = conv.messages.len();
-                        }
+                    if let Some(ref id) = self.active_conversation
+                        && let Some(conv) = self.store.conversations.get(id)
+                    {
+                        self.scroll_offset = conv.messages.len();
                     }
                     self.focused_msg_index = None;
                     return None;
                 }
                 ('d', KeyCode::Char('d')) => {
                     // dd = delete message
-                    if let Some(msg) = self.selected_message() {
-                        if !msg.is_system && !msg.is_deleted {
-                            self.show_delete_confirm = true;
-                        }
+                    if let Some(msg) = self.selected_message()
+                        && !msg.is_system
+                        && !msg.is_deleted
+                    {
+                        self.open_overlay(OverlayKind::DeleteConfirm);
                     }
                     return None;
                 }
@@ -3635,7 +3851,7 @@ impl App {
             }
             Some(KeyAction::SidebarSearch) => {
                 self.sidebar_visible = true;
-                self.sidebar_filter_active = true;
+                self.open_overlay(OverlayKind::SidebarFilter);
                 self.sidebar_filter.clear();
                 self.sidebar_filtered.clear();
                 None
@@ -3659,54 +3875,58 @@ impl App {
             }
             Some(KeyAction::React) => {
                 if self.selected_message().is_some_and(|m| !m.is_system) {
-                    self.reactions.show_picker = true;
+                    self.open_overlay(OverlayKind::ReactionPicker);
                     self.reactions.picker_index = 0;
                 }
                 None
             }
             Some(KeyAction::Quote) => {
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        let author_phone = msg.sender_id.clone();
-                        let snippet: String = if msg.body.chars().count() > 50 {
-                            format!("{}…", msg.body.chars().take(50).collect::<String>())
-                        } else {
-                            msg.body.clone()
-                        };
-                        let ts = msg.timestamp_ms;
-                        let phone = if author_phone.is_empty() || author_phone == "you" {
-                            self.account.clone()
-                        } else {
-                            author_phone
-                        };
-                        self.reply_target = Some((phone, snippet, ts));
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    let author_phone = msg.sender_id.clone();
+                    let snippet: String = if msg.body.chars().count() > 50 {
+                        format!("{}…", msg.body.chars().take(50).collect::<String>())
+                    } else {
+                        msg.body.clone()
+                    };
+                    let ts = msg.timestamp_ms;
+                    let phone = if author_phone.is_empty() || author_phone == "you" {
+                        self.account.clone()
+                    } else {
+                        author_phone
+                    };
+                    self.reply_target = Some((phone, snippet, ts));
+                    self.mode = InputMode::Insert;
+                }
+                None
+            }
+            Some(KeyAction::EditMessage) => {
+                if let Some(msg) = self.selected_message()
+                    && msg.sender == "you"
+                    && !msg.is_deleted
+                    && !msg.is_system
+                {
+                    let ts = msg.timestamp_ms;
+                    let body = msg.body.clone();
+                    if let Some(ref conv_id) = self.active_conversation {
+                        let conv_id = conv_id.clone();
+                        self.editing_message = Some((ts, conv_id));
+                        self.input_buffer = body;
+                        self.input_cursor = self.input_buffer.len();
                         self.mode = InputMode::Insert;
                     }
                 }
                 None
             }
-            Some(KeyAction::EditMessage) => {
-                if let Some(msg) = self.selected_message() {
-                    if msg.sender == "you" && !msg.is_deleted && !msg.is_system {
-                        let ts = msg.timestamp_ms;
-                        let body = msg.body.clone();
-                        if let Some(ref conv_id) = self.active_conversation {
-                            let conv_id = conv_id.clone();
-                            self.editing_message = Some((ts, conv_id));
-                            self.input_buffer = body;
-                            self.input_cursor = self.input_buffer.len();
-                            self.mode = InputMode::Insert;
-                        }
-                    }
-                }
-                None
-            }
             Some(KeyAction::ForwardMessage) => {
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        self.forward.body = msg.body.clone();
-                        self.open_forward_picker();
-                    }
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    self.forward.body = msg.body.clone();
+                    self.open_forward_picker();
                 }
                 None
             }
@@ -3724,7 +3944,7 @@ impl App {
             }
             Some(KeyAction::OpenActionMenu) => {
                 if self.selected_message().is_some_and(|m| !m.is_system) {
-                    self.action_menu.show = true;
+                    self.open_overlay(OverlayKind::ActionMenu);
                     self.action_menu.index = 0;
                 }
                 None
@@ -3740,10 +3960,10 @@ impl App {
             }
             _ => {
                 // Handle prefix keys that aren't in the binding map
-                if let KeyCode::Char(c @ ('g' | 'd')) = code {
-                    if modifiers.is_empty() {
-                        self.pending_normal_key = Some(c);
-                    }
+                if let KeyCode::Char(c @ ('g' | 'd')) = code
+                    && modifiers.is_empty()
+                {
+                    self.pending_normal_key = Some(c);
                 }
                 None
             }
@@ -3764,7 +3984,7 @@ impl App {
             Some(KeyAction::ExitInsert) => {
                 self.mode = InputMode::Normal;
                 self.pending_normal_key = None; // defensive reset
-                self.autocomplete.visible = false;
+                self.close_overlay();
                 self.reply_target = None;
                 self.editing_message = None;
                 if self.typing.reset() {
@@ -3775,7 +3995,7 @@ impl App {
             Some(KeyAction::InsertNewline) => {
                 self.input_buffer.insert(self.input_cursor, '\n');
                 self.input_cursor += 1;
-                self.autocomplete.visible = false;
+                self.close_overlay();
                 self.typing.last_keypress = Some(Instant::now());
                 if !self.typing.sent
                     && !self.input_buffer.starts_with('/')
@@ -3854,60 +4074,65 @@ impl App {
             }
             Some(KeyAction::React) => {
                 if self.selected_message().is_some_and(|m| !m.is_system) {
-                    self.reactions.show_picker = true;
+                    self.open_overlay(OverlayKind::ReactionPicker);
                     self.reactions.picker_index = 0;
                 }
                 None
             }
             Some(KeyAction::Quote) => {
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        let author_phone = msg.sender_id.clone();
-                        let snippet: String = if msg.body.chars().count() > 50 {
-                            format!("{}…", msg.body.chars().take(50).collect::<String>())
-                        } else {
-                            msg.body.clone()
-                        };
-                        let ts = msg.timestamp_ms;
-                        let phone = if author_phone.is_empty() || author_phone == "you" {
-                            self.account.clone()
-                        } else {
-                            author_phone
-                        };
-                        self.reply_target = Some((phone, snippet, ts));
-                    }
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    let author_phone = msg.sender_id.clone();
+                    let snippet: String = if msg.body.chars().count() > 50 {
+                        format!("{}…", msg.body.chars().take(50).collect::<String>())
+                    } else {
+                        msg.body.clone()
+                    };
+                    let ts = msg.timestamp_ms;
+                    let phone = if author_phone.is_empty() || author_phone == "you" {
+                        self.account.clone()
+                    } else {
+                        author_phone
+                    };
+                    self.reply_target = Some((phone, snippet, ts));
                 }
                 None
             }
             Some(KeyAction::EditMessage) => {
-                if let Some(msg) = self.selected_message() {
-                    if msg.sender == "you" && !msg.is_deleted && !msg.is_system {
-                        let ts = msg.timestamp_ms;
-                        let body = msg.body.clone();
-                        if let Some(ref conv_id) = self.active_conversation {
-                            let conv_id = conv_id.clone();
-                            self.editing_message = Some((ts, conv_id));
-                            self.input_buffer = body;
-                            self.input_cursor = self.input_buffer.len();
-                        }
+                if let Some(msg) = self.selected_message()
+                    && msg.sender == "you"
+                    && !msg.is_deleted
+                    && !msg.is_system
+                {
+                    let ts = msg.timestamp_ms;
+                    let body = msg.body.clone();
+                    if let Some(ref conv_id) = self.active_conversation {
+                        let conv_id = conv_id.clone();
+                        self.editing_message = Some((ts, conv_id));
+                        self.input_buffer = body;
+                        self.input_cursor = self.input_buffer.len();
                     }
                 }
                 None
             }
             Some(KeyAction::ForwardMessage) => {
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        self.forward.body = msg.body.clone();
-                        self.open_forward_picker();
-                    }
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    self.forward.body = msg.body.clone();
+                    self.open_forward_picker();
                 }
                 None
             }
             Some(KeyAction::DeleteMessage) => {
-                if let Some(msg) = self.selected_message() {
-                    if !msg.is_system && !msg.is_deleted {
-                        self.show_delete_confirm = true;
-                    }
+                if let Some(msg) = self.selected_message()
+                    && !msg.is_system
+                    && !msg.is_deleted
+                {
+                    self.open_overlay(OverlayKind::DeleteConfirm);
                 }
                 None
             }
@@ -3925,7 +4150,7 @@ impl App {
             }
             Some(KeyAction::OpenActionMenu) => {
                 if self.selected_message().is_some_and(|m| !m.is_system) {
-                    self.action_menu.show = true;
+                    self.open_overlay(OverlayKind::ActionMenu);
                     self.action_menu.index = 0;
                 }
                 None
@@ -3999,13 +4224,8 @@ impl App {
                 is_typing,
                 group_id,
             } => {
-                // Store name in contact lookup if we learned it from this event
-                if let Some(ref name) = sender_name {
-                    self.store
-                        .contact_names
-                        .entry(sender.clone())
-                        .or_insert_with(|| name.clone());
-                }
+                self.store
+                    .remember_contact_name(&sender, sender_name.as_deref());
                 // Key by group ID for group messages, sender phone for 1:1
                 let conv_key = group_id.as_ref().unwrap_or(&sender).clone();
                 if is_typing {
@@ -4030,12 +4250,8 @@ impl App {
                 target_timestamp,
                 is_remove,
             } => {
-                if let Some(ref name) = sender_name {
-                    self.store
-                        .contact_names
-                        .entry(sender.clone())
-                        .or_insert_with(|| name.clone());
-                }
+                self.store
+                    .remember_contact_name(&sender, sender_name.as_deref());
                 self.handle_reaction(
                     &conv_id,
                     &emoji,
@@ -4047,13 +4263,15 @@ impl App {
             }
             SignalEvent::EditReceived {
                 conv_id,
-                sender: _,
-                sender_name: _,
+                sender,
+                sender_name,
                 target_timestamp,
                 new_body,
                 new_timestamp: _,
                 is_outgoing: _,
             } => {
+                self.store
+                    .remember_contact_name(&sender, sender_name.as_deref());
                 self.handle_edit_received(&conv_id, target_timestamp, &new_body);
             }
             SignalEvent::RemoteDeleteReceived {
@@ -4070,12 +4288,8 @@ impl App {
                 target_author: _,
                 target_timestamp,
             } => {
-                if let Some(ref name) = sender_name {
-                    self.store
-                        .contact_names
-                        .entry(sender.clone())
-                        .or_insert_with(|| name.clone());
-                }
+                self.store
+                    .remember_contact_name(&sender, sender_name.as_deref());
                 self.handle_pin_received(&conv_id, &sender, target_timestamp, true);
             }
             SignalEvent::UnpinReceived {
@@ -4085,12 +4299,8 @@ impl App {
                 target_author: _,
                 target_timestamp,
             } => {
-                if let Some(ref name) = sender_name {
-                    self.store
-                        .contact_names
-                        .entry(sender.clone())
-                        .or_insert_with(|| name.clone());
-                }
+                self.store
+                    .remember_contact_name(&sender, sender_name.as_deref());
                 self.handle_pin_received(&conv_id, &sender, target_timestamp, false);
             }
             SignalEvent::PollCreated {
@@ -4108,12 +4318,8 @@ impl App {
                 option_indexes,
                 vote_count,
             } => {
-                if let Some(ref name) = voter_name {
-                    self.store
-                        .contact_names
-                        .entry(voter.clone())
-                        .or_insert_with(|| name.clone());
-                }
+                self.store
+                    .remember_contact_name(&voter, voter_name.as_deref());
                 self.handle_poll_vote(
                     &conv_id,
                     target_timestamp,
@@ -4195,7 +4401,9 @@ impl App {
             msg.source.clone()
         };
 
-        if self.store.move_conversation_to_top(&conv_id) && self.sidebar_filter_active {
+        if self.store.move_conversation_to_top(&conv_id)
+            && self.is_overlay(OverlayKind::SidebarFilter)
+        {
             self.refresh_sidebar_filter();
         }
 
@@ -4209,20 +4417,16 @@ impl App {
 
         // Store source_name in contact lookup for future resolution (typing indicators, etc.)
         if !msg.is_outgoing {
-            if let Some(ref name) = msg.source_name {
-                self.store
-                    .contact_names
-                    .entry(msg.source.clone())
-                    .or_insert_with(|| name.clone());
-            }
+            self.store
+                .remember_contact_name(&msg.source, msg.source_name.as_deref());
             // Populate UUID->name for @mention resolution
-            if let (Some(ref uuid), Some(ref name)) = (&msg.source_uuid, &msg.source_name) {
-                if !name.is_empty() {
-                    self.store
-                        .uuid_to_name
-                        .entry(uuid.clone())
-                        .or_insert_with(|| name.clone());
-                }
+            if let (Some(uuid), Some(name)) = (&msg.source_uuid, &msg.source_name)
+                && !name.is_empty()
+            {
+                self.store
+                    .uuid_to_name
+                    .entry(uuid.clone())
+                    .or_insert_with(|| name.clone());
             }
         }
 
@@ -4276,7 +4480,6 @@ impl App {
             self.db_warn_visible(self.db.update_accepted(&conv_id, false), "update_accepted");
         }
 
-        let ts_rfc3339 = msg.timestamp.to_rfc3339();
         let msg_ts_ms = msg.timestamp.timestamp_millis();
         // Outgoing synced messages already have a server timestamp; incoming messages have no status
         let msg_status = if msg.is_outgoing {
@@ -4299,14 +4502,14 @@ impl App {
         };
 
         // Keep conversation's expiration_timer in sync with incoming messages
-        if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-            if conv.expiration_timer != msg_expires_in {
-                conv.expiration_timer = msg_expires_in;
-                db_warn(
-                    self.db.update_expiration_timer(&conv_id, msg_expires_in),
-                    "update_expiration_timer",
-                );
-            }
+        if let Some(conv) = self.store.conversations.get_mut(&conv_id)
+            && conv.expiration_timer != msg_expires_in
+        {
+            conv.expiration_timer = msg_expires_in;
+            db_warn(
+                self.db.update_expiration_timer(&conv_id, msg_expires_in),
+                "update_expiration_timer",
+            );
         }
 
         // Resolve @mentions before the push closure borrows self mutably
@@ -4355,7 +4558,7 @@ impl App {
         let wire_quote_body = msg_quote.as_ref().map(|(_, _, b, _)| b.clone());
         let wire_quote_ts = msg_quote.as_ref().map(|(_, _, _, t)| *t);
 
-        // Helper: insert a DisplayMessage in timestamp order and persist to DB
+        // Helper: build a DisplayMessage in timestamp order and persist via on_message_added.
         let mut push_msg = |body: String,
                             image_lines: Option<Vec<Line<'static>>>,
                             image_path: Option<String>,
@@ -4369,67 +4572,42 @@ impl App {
                 .poll_vote
                 .pending_polls
                 .remove(&(conv_id.clone(), msg_ts_ms));
-            if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-                let pos = conv
-                    .messages
-                    .partition_point(|m| m.timestamp_ms <= msg_ts_ms);
-                conv.messages.insert(
-                    pos,
-                    DisplayMessage {
-                        sender: sender_display.clone(),
-                        timestamp: msg.timestamp,
-                        body: body.clone(),
-                        is_system: false,
-                        image_lines,
-                        image_path,
-                        status: msg_status,
-                        timestamp_ms: msg_ts_ms,
-                        reactions: Vec::new(),
-                        mention_ranges,
-                        style_ranges,
-                        body_raw: body_raw.clone(),
-                        mentions: mentions.clone(),
-                        quote,
-                        is_edited: false,
-                        is_deleted: false,
-                        is_pinned: false,
-                        sender_id: sender_id.clone(),
-                        expires_in_seconds: msg_expires_in,
-                        expiration_start_ms: msg_expiration_start,
-                        poll_data: deferred_poll,
-                        poll_votes: Vec::new(),
-                        preview: None,
-                        preview_image_lines: None,
-                        preview_image_path: None,
-                    },
-                );
-                // Bump last_read_index if we inserted before the read marker
-                if let Some(read_idx) = self.store.last_read_index.get_mut(&conv_id) {
-                    if pos <= *read_idx {
-                        *read_idx += 1;
-                    }
-                }
-                if msg_expires_in > 0 {
-                    self.expiring_msg_count += 1;
-                }
-            }
-            db_warn(
-                self.db.insert_message_full(
-                    &conv_id,
-                    &sender_display,
-                    &ts_rfc3339,
-                    &body,
-                    false,
-                    msg_status,
-                    msg_ts_ms,
-                    &sender_id,
-                    wire_quote_author.as_deref(),
-                    wire_quote_body.as_deref(),
-                    wire_quote_ts,
-                    msg_expires_in,
-                    msg_expiration_start,
-                ),
-                "insert_message",
+            let display = DisplayMessage {
+                sender: sender_display.clone(),
+                timestamp: msg.timestamp,
+                body,
+                is_system: false,
+                image_lines,
+                image_path,
+                status: msg_status,
+                timestamp_ms: msg_ts_ms,
+                reactions: Vec::new(),
+                mention_ranges,
+                style_ranges,
+                body_raw,
+                mentions,
+                quote,
+                is_edited: false,
+                is_deleted: false,
+                is_pinned: false,
+                sender_id: sender_id.clone(),
+                expires_in_seconds: msg_expires_in,
+                expiration_start_ms: msg_expiration_start,
+                poll_data: deferred_poll,
+                poll_votes: Vec::new(),
+                preview: None,
+                preview_image_lines: None,
+                preview_image_path: None,
+            };
+            self.on_message_added(
+                &conv_id,
+                display,
+                WireQuote {
+                    author: wire_quote_author.clone(),
+                    body: wire_quote_body.clone(),
+                    timestamp: wire_quote_ts,
+                },
+                true,
             );
         };
 
@@ -4499,42 +4677,39 @@ impl App {
 
         // Persist raw body + mentions so the display body can be re-resolved
         // later when the contact list or group list fills in unknown UUIDs.
-        if had_mentions {
-            if let Some(ref raw) = msg.body {
-                db_warn(
-                    self.db
-                        .upsert_message_mentions(&conv_id, msg_ts_ms, raw, &msg.mentions),
-                    "upsert_message_mentions",
-                );
-            }
+        if had_mentions && let Some(ref raw) = msg.body {
+            db_warn(
+                self.db
+                    .upsert_message_mentions(&conv_id, msg_ts_ms, raw, &msg.mentions),
+                "upsert_message_mentions",
+            );
         }
 
         // Attach first link preview to the body message (not attachment messages)
         if let Some(preview) = msg.previews.into_iter().next() {
-            if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-                if let Some(dm) = conv
+            if let Some(conv) = self.store.conversations.get_mut(&conv_id)
+                && let Some(dm) = conv
                     .messages
                     .iter_mut()
                     .rev()
                     .find(|m| m.timestamp_ms == msg_ts_ms && !m.body.starts_with('['))
-                {
-                    let (img_lines, img_path) =
-                        if self.image.show_link_previews && self.image.image_mode != "none" {
-                            if let Some(ref p) = preview.image_path {
-                                (
-                                    image_render::render_image(Path::new(p), 30),
-                                    Some(p.clone()),
-                                )
-                            } else {
-                                (None, None)
-                            }
+            {
+                let (img_lines, img_path) =
+                    if self.image.show_link_previews && self.image.image_mode != "none" {
+                        if let Some(ref p) = preview.image_path {
+                            (
+                                image_render::render_image(Path::new(p), 30),
+                                Some(p.clone()),
+                            )
                         } else {
                             (None, None)
-                        };
-                    dm.preview = Some(preview.clone());
-                    dm.preview_image_lines = img_lines;
-                    dm.preview_image_path = img_path;
-                }
+                        }
+                    } else {
+                        (None, None)
+                    };
+                dm.preview = Some(preview.clone());
+                dm.preview_image_lines = img_lines;
+                dm.preview_image_path = img_path;
             }
             db_warn(
                 self.db.upsert_link_preview(&conv_id, msg_ts_ms, &preview),
@@ -4659,53 +4834,34 @@ impl App {
             .unwrap_or_else(|| conv_id.to_string());
         self.store
             .get_or_create_conversation(conv_id, &conv_name, is_group, &self.db);
-        if let Some(conv) = self.store.conversations.get_mut(conv_id) {
-            let pos = conv
-                .messages
-                .partition_point(|m| m.timestamp_ms <= timestamp_ms);
-            conv.messages.insert(
-                pos,
-                DisplayMessage {
-                    sender: String::new(),
-                    timestamp,
-                    body: body.to_string(),
-                    is_system: true,
-                    image_lines: None,
-                    image_path: None,
-                    status: None,
-                    timestamp_ms,
-                    reactions: Vec::new(),
-                    mention_ranges: Vec::new(),
-                    style_ranges: Vec::new(),
-                    body_raw: None,
-                    mentions: Vec::new(),
-                    quote: None,
-                    is_edited: false,
-                    is_deleted: false,
-                    is_pinned: false,
-                    sender_id: String::new(),
-                    expires_in_seconds: 0,
-                    expiration_start_ms: 0,
-                    poll_data: None,
-                    poll_votes: Vec::new(),
-                    preview: None,
-                    preview_image_lines: None,
-                    preview_image_path: None,
-                },
-            );
-            // Bump last_read_index if we inserted before the read marker
-            if let Some(read_idx) = self.store.last_read_index.get_mut(conv_id) {
-                if pos <= *read_idx {
-                    *read_idx += 1;
-                }
-            }
-        }
-        let ts_rfc3339 = timestamp.to_rfc3339();
-        self.db_warn_visible(
-            self.db
-                .insert_message(conv_id, "", &ts_rfc3339, body, true, None, timestamp_ms),
-            "insert_system_message",
-        );
+        let msg = DisplayMessage {
+            sender: String::new(),
+            timestamp,
+            body: body.to_string(),
+            is_system: true,
+            image_lines: None,
+            image_path: None,
+            status: None,
+            timestamp_ms,
+            reactions: Vec::new(),
+            mention_ranges: Vec::new(),
+            style_ranges: Vec::new(),
+            body_raw: None,
+            mentions: Vec::new(),
+            quote: None,
+            is_edited: false,
+            is_deleted: false,
+            is_pinned: false,
+            sender_id: String::new(),
+            expires_in_seconds: 0,
+            expiration_start_ms: 0,
+            poll_data: None,
+            poll_votes: Vec::new(),
+            preview: None,
+            preview_image_lines: None,
+            preview_image_path: None,
+        };
+        self.on_message_added(conv_id, msg, WireQuote::default(), true);
     }
 
     /// Remove expired disappearing messages from memory and DB.
@@ -4735,10 +4891,10 @@ impl App {
 
         // Clean up DB
         let removed = removed_count > 0;
-        if let Ok(n) = self.db.delete_expired_messages(now_ms) {
-            if n > 0 {
-                return true;
-            }
+        if let Ok(n) = self.db.delete_expired_messages(now_ms)
+            && n > 0
+        {
+            return true;
         }
 
         removed
@@ -4833,11 +4989,7 @@ impl App {
                     m.sender == target_author
                         || target_display.as_deref() == Some(m.sender.as_str())
                 };
-                if matches {
-                    Some(idx)
-                } else {
-                    None
-                }
+                if matches { Some(idx) } else { None }
             });
             if let Some(msg) = found.map(|idx| &mut conv.messages[idx]) {
                 if is_remove {
@@ -4882,7 +5034,7 @@ impl App {
     pub fn handle_delete_confirm_key(&mut self, code: KeyCode) -> Option<SendRequest> {
         match code {
             KeyCode::Char('y') => {
-                self.show_delete_confirm = false;
+                self.close_overlay();
                 let conv_id = self.active_conversation.clone()?;
                 let conv = self.store.conversations.get(&conv_id)?;
                 let is_group = conv.is_group;
@@ -4916,7 +5068,7 @@ impl App {
             }
             KeyCode::Char('l') => {
                 // Local-only delete (for outgoing messages)
-                self.show_delete_confirm = false;
+                self.close_overlay();
                 let conv_id = self.active_conversation.clone()?;
                 let conv = self.store.conversations.get(&conv_id)?;
                 let index = self
@@ -4937,7 +5089,7 @@ impl App {
                 None
             }
             KeyCode::Char('n') | KeyCode::Esc => {
-                self.show_delete_confirm = false;
+                self.close_overlay();
                 None
             }
             _ => None,
@@ -4945,11 +5097,11 @@ impl App {
     }
 
     fn handle_edit_received(&mut self, conv_id: &str, target_timestamp: i64, new_body: &str) {
-        if let Some(conv) = self.store.conversations.get_mut(conv_id) {
-            if let Some(idx) = conv.find_msg_idx(target_timestamp) {
-                conv.messages[idx].body = new_body.to_string();
-                conv.messages[idx].is_edited = true;
-            }
+        if let Some(conv) = self.store.conversations.get_mut(conv_id)
+            && let Some(idx) = conv.find_msg_idx(target_timestamp)
+        {
+            conv.messages[idx].body = new_body.to_string();
+            conv.messages[idx].is_edited = true;
         }
         self.db_warn_visible(
             self.db
@@ -4959,12 +5111,12 @@ impl App {
     }
 
     fn handle_remote_delete(&mut self, conv_id: &str, target_timestamp: i64) {
-        if let Some(conv) = self.store.conversations.get_mut(conv_id) {
-            if let Some(idx) = conv.find_msg_idx(target_timestamp) {
-                conv.messages[idx].is_deleted = true;
-                conv.messages[idx].body = "[deleted]".to_string();
-                conv.messages[idx].reactions.clear();
-            }
+        if let Some(conv) = self.store.conversations.get_mut(conv_id)
+            && let Some(idx) = conv.find_msg_idx(target_timestamp)
+        {
+            conv.messages[idx].is_deleted = true;
+            conv.messages[idx].body = "[deleted]".to_string();
+            conv.messages[idx].reactions.clear();
         }
         self.db_warn_visible(
             self.db.mark_message_deleted(conv_id, target_timestamp),
@@ -4979,10 +5131,10 @@ impl App {
         target_timestamp: i64,
         pinned: bool,
     ) {
-        if let Some(conv) = self.store.conversations.get_mut(conv_id) {
-            if let Some(idx) = conv.find_msg_idx(target_timestamp) {
-                conv.messages[idx].is_pinned = pinned;
-            }
+        if let Some(conv) = self.store.conversations.get_mut(conv_id)
+            && let Some(idx) = conv.find_msg_idx(target_timestamp)
+        {
+            conv.messages[idx].is_pinned = pinned;
         }
         self.db_warn_visible(
             self.db
@@ -5034,22 +5186,22 @@ impl App {
         option_indexes: &[i64],
         vote_count: i64,
     ) {
-        if let Some(conv) = self.store.conversations.get_mut(conv_id) {
-            if let Some(idx) = conv.find_msg_idx(target_timestamp) {
-                let msg = &mut conv.messages[idx];
-                // Upsert vote in memory
-                if let Some(existing) = msg.poll_votes.iter_mut().find(|v| v.voter == voter) {
-                    existing.option_indexes = option_indexes.to_vec();
-                    existing.vote_count = vote_count;
-                    existing.voter_name = voter_name.map(|s| s.to_string());
-                } else {
-                    msg.poll_votes.push(PollVote {
-                        voter: voter.to_string(),
-                        voter_name: voter_name.map(|s| s.to_string()),
-                        option_indexes: option_indexes.to_vec(),
-                        vote_count,
-                    });
-                }
+        if let Some(conv) = self.store.conversations.get_mut(conv_id)
+            && let Some(idx) = conv.find_msg_idx(target_timestamp)
+        {
+            let msg = &mut conv.messages[idx];
+            // Upsert vote in memory
+            if let Some(existing) = msg.poll_votes.iter_mut().find(|v| v.voter == voter) {
+                existing.option_indexes = option_indexes.to_vec();
+                existing.vote_count = vote_count;
+                existing.voter_name = voter_name.map(|s| s.to_string());
+            } else {
+                msg.poll_votes.push(PollVote {
+                    voter: voter.to_string(),
+                    voter_name: voter_name.map(|s| s.to_string()),
+                    option_indexes: option_indexes.to_vec(),
+                    vote_count,
+                });
             }
         }
         self.db_warn_visible(
@@ -5066,12 +5218,11 @@ impl App {
     }
 
     fn handle_poll_terminated(&mut self, conv_id: &str, target_timestamp: i64) {
-        if let Some(conv) = self.store.conversations.get_mut(conv_id) {
-            if let Some(idx) = conv.find_msg_idx(target_timestamp) {
-                if let Some(ref mut poll) = conv.messages[idx].poll_data {
-                    poll.closed = true;
-                }
-            }
+        if let Some(conv) = self.store.conversations.get_mut(conv_id)
+            && let Some(idx) = conv.find_msg_idx(target_timestamp)
+            && let Some(ref mut poll) = conv.messages[idx].poll_data
+        {
+            poll.closed = true;
         }
         self.db_warn_visible(self.db.close_poll(conv_id, target_timestamp), "close_poll");
     }
@@ -5100,10 +5251,10 @@ impl App {
 
         if was_pinned {
             // Unpin immediately — no duration needed
-            if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-                if let Some(idx) = conv.find_msg_idx(target_timestamp) {
-                    conv.messages[idx].is_pinned = false;
-                }
+            if let Some(conv) = self.store.conversations.get_mut(&conv_id)
+                && let Some(idx) = conv.find_msg_idx(target_timestamp)
+            {
+                conv.messages[idx].is_pinned = false;
             }
             self.db_warn_visible(
                 self.db
@@ -5130,7 +5281,7 @@ impl App {
                 target_author,
                 target_timestamp,
             });
-            self.pin_duration.show = true;
+            self.open_overlay(OverlayKind::PinDuration);
             self.pin_duration.index = 0;
             None
         }
@@ -5151,14 +5302,14 @@ impl App {
             }
             ListKeyAction::Select => {
                 let duration = PIN_DURATIONS[self.pin_duration.index].0;
-                self.pin_duration.show = false;
+                self.close_overlay();
                 let pending = self.pin_duration.pending.take()?;
 
                 // Optimistically pin
-                if let Some(conv) = self.store.conversations.get_mut(&pending.conv_id) {
-                    if let Some(idx) = conv.find_msg_idx(pending.target_timestamp) {
-                        conv.messages[idx].is_pinned = true;
-                    }
+                if let Some(conv) = self.store.conversations.get_mut(&pending.conv_id)
+                    && let Some(idx) = conv.find_msg_idx(pending.target_timestamp)
+                {
+                    conv.messages[idx].is_pinned = true;
                 }
                 self.db_warn_visible(
                     self.db
@@ -5181,7 +5332,7 @@ impl App {
                 })
             }
             ListKeyAction::Close => {
-                self.pin_duration.show = false;
+                self.close_overlay();
                 self.pin_duration.pending = None;
                 None
             }
@@ -5237,7 +5388,7 @@ impl App {
                         self.status_message = "Given name is required".to_string();
                         return None;
                     }
-                    self.profile.show = false;
+                    self.close_overlay();
                     return Some(SendRequest::UpdateProfile {
                         given_name,
                         family_name,
@@ -5247,7 +5398,7 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                self.profile.show = false;
+                self.close_overlay();
             }
             _ => {}
         }
@@ -5291,14 +5442,14 @@ impl App {
                     .selections
                     .iter()
                     .enumerate()
-                    .filter(|(_, &sel)| sel)
+                    .filter(|&(_, &sel)| sel)
                     .map(|(i, _)| i as i64)
                     .collect();
                 if selected.is_empty() {
                     return None;
                 }
                 let pending = self.poll_vote.pending.take()?;
-                self.poll_vote.show = false;
+                self.close_overlay();
 
                 // Optimistic local vote
                 let voter = self.account.clone();
@@ -5321,7 +5472,7 @@ impl App {
                 })
             }
             KeyCode::Esc => {
-                self.poll_vote.show = false;
+                self.close_overlay();
                 self.poll_vote.pending = None;
                 None
             }
@@ -5409,36 +5560,36 @@ impl App {
         self.startup_status.clear();
         for contact in contacts {
             // Store name in lookup for future message resolution
-            if let Some(ref name) = contact.name {
-                if !name.is_empty() {
-                    self.store
-                        .contact_names
-                        .insert(contact.number.clone(), name.clone());
-                }
+            if let Some(ref name) = contact.name
+                && !name.is_empty()
+            {
+                self.store
+                    .contact_names
+                    .insert(contact.number.clone(), name.clone());
             }
             // Build UUID maps for @mention resolution
             if let Some(ref uuid) = contact.uuid {
-                if let Some(ref name) = contact.name {
-                    if !name.is_empty() {
-                        self.store.uuid_to_name.insert(uuid.clone(), name.clone());
-                    }
+                if let Some(ref name) = contact.name
+                    && !name.is_empty()
+                {
+                    self.store.uuid_to_name.insert(uuid.clone(), name.clone());
                 }
                 self.store
                     .number_to_uuid
                     .insert(contact.number.clone(), uuid.clone());
             }
             // Update name on existing conversations only — don't create new ones
-            if let Some(conv) = self.store.conversations.get_mut(&contact.number) {
-                if let Some(ref contact_name) = contact.name {
-                    if !contact_name.is_empty() && conv.name != *contact_name {
-                        conv.name = contact_name.clone();
-                        db_warn(
-                            self.db
-                                .upsert_conversation(&contact.number, contact_name, false),
-                            "upsert_conversation",
-                        );
-                    }
-                }
+            if let Some(conv) = self.store.conversations.get_mut(&contact.number)
+                && let Some(ref contact_name) = contact.name
+                && !contact_name.is_empty()
+                && conv.name != *contact_name
+            {
+                conv.name = contact_name.clone();
+                db_warn(
+                    self.db
+                        .upsert_conversation(&contact.number, contact_name, false),
+                    "upsert_conversation",
+                );
             }
         }
         // Auto-accept unaccepted 1:1 conversations whose sender is now a known contact
@@ -5484,13 +5635,13 @@ impl App {
             }
             // Populate UUID->name from group members (phone->uuid + phone->name)
             for (phone, uuid) in &group.member_uuids {
-                if let Some(name) = self.store.contact_names.get(phone) {
-                    if !name.is_empty() {
-                        self.store
-                            .uuid_to_name
-                            .entry(uuid.clone())
-                            .or_insert_with(|| name.clone());
-                    }
+                if let Some(name) = self.store.contact_names.get(phone)
+                    && !name.is_empty()
+                {
+                    self.store
+                        .uuid_to_name
+                        .entry(uuid.clone())
+                        .or_insert_with(|| name.clone());
                 }
             }
             // Store group for @mention member lookup
@@ -5524,42 +5675,41 @@ impl App {
             }
         }
         // If verify overlay is open, refresh the displayed identities
-        if self.verify.show {
-            if let Some(ref conv_id) = self.active_conversation {
-                let conv_id = conv_id.clone();
-                let is_group = self
-                    .store
-                    .conversations
-                    .get(&conv_id)
-                    .map(|c| c.is_group)
-                    .unwrap_or(false);
-                if is_group {
-                    if let Some(group) = self.store.groups.get(&conv_id) {
-                        let members: HashSet<&str> =
-                            group.members.iter().map(|s| s.as_str()).collect();
-                        self.verify.identities = identities
-                            .iter()
-                            .filter(|id| {
-                                id.number
-                                    .as_ref()
-                                    .is_some_and(|n| members.contains(n.as_str()))
-                            })
-                            .cloned()
-                            .collect();
-                    }
-                } else {
+        if self.is_overlay(OverlayKind::Verify)
+            && let Some(ref conv_id) = self.active_conversation
+        {
+            let conv_id = conv_id.clone();
+            let is_group = self
+                .store
+                .conversations
+                .get(&conv_id)
+                .map(|c| c.is_group)
+                .unwrap_or(false);
+            if is_group {
+                if let Some(group) = self.store.groups.get(&conv_id) {
+                    let members: HashSet<&str> = group.members.iter().map(|s| s.as_str()).collect();
                     self.verify.identities = identities
                         .iter()
-                        .filter(|id| id.number.as_deref() == Some(conv_id.as_str()))
+                        .filter(|id| {
+                            id.number
+                                .as_ref()
+                                .is_some_and(|n| members.contains(n.as_str()))
+                        })
                         .cloned()
                         .collect();
                 }
-                // Clamp index
-                if !self.verify.identities.is_empty()
-                    && self.verify.index >= self.verify.identities.len()
-                {
-                    self.verify.index = self.verify.identities.len() - 1;
-                }
+            } else {
+                self.verify.identities = identities
+                    .iter()
+                    .filter(|id| id.number.as_deref() == Some(conv_id.as_str()))
+                    .cloned()
+                    .collect();
+            }
+            // Clamp index
+            if !self.verify.identities.is_empty()
+                && self.verify.index >= self.verify.identities.len()
+            {
+                self.verify.index = self.verify.identities.len() - 1;
             }
         }
     }
@@ -5579,10 +5729,10 @@ impl App {
         let mut found: Vec<(usize, usize, String)> = Vec::new(); // (byte_start, byte_end, uuid)
         for (name, uuid) in &self.autocomplete.pending_mentions {
             let pattern = format!("@{name}");
-            if let Some(uuid) = uuid {
-                if let Some(pos) = wire.find(&pattern) {
-                    found.push((pos, pos + pattern.len(), uuid.clone()));
-                }
+            if let Some(uuid) = uuid
+                && let Some(pos) = wire.find(&pattern)
+            {
+                found.push((pos, pos + pattern.len(), uuid.clone()));
             }
         }
         found.sort_by_key(|b| std::cmp::Reverse(b.0)); // reverse order
@@ -5665,14 +5815,13 @@ impl App {
         }
         if let Some((conv_id, local_ts)) = self.pending_sends.remove(rpc_id) {
             let mut found = false;
-            if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-                if let Some(idx) = conv
+            if let Some(conv) = self.store.conversations.get_mut(&conv_id)
+                && let Some(idx) = conv
                     .find_msg_idx(local_ts)
                     .filter(|&idx| conv.messages[idx].sender == "you")
-                {
-                    conv.messages[idx].status = Some(MessageStatus::Failed);
-                    found = true;
-                }
+            {
+                conv.messages[idx].status = Some(MessageStatus::Failed);
+                found = true;
             }
             if found {
                 self.db_warn_visible(
@@ -5700,14 +5849,14 @@ impl App {
             .find_msg_idx(ts)
             .filter(|&idx| conv.messages[idx].sender == "you")
         {
-            if let Some(current) = conv.messages[idx].status {
-                if new_status > current {
-                    conv.messages[idx].status = Some(new_status);
-                    db_warn(
-                        db.update_message_status(conv_id, ts, new_status.to_i32()),
-                        "update_message_status",
-                    );
-                }
+            if let Some(current) = conv.messages[idx].status
+                && new_status > current
+            {
+                conv.messages[idx].status = Some(new_status);
+                db_warn(
+                    db.update_message_status(conv_id, ts, new_status.to_i32()),
+                    "update_message_status",
+                );
             }
             return true;
         }
@@ -5933,73 +6082,57 @@ impl App {
                         .unwrap_or(0);
                     let out_expiry_start = if out_expires > 0 { local_ts_ms } else { 0 };
 
-                    if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-                        conv.messages.push(DisplayMessage {
-                            sender: "you".to_string(),
-                            timestamp: now,
-                            body: display_body.clone(),
-                            is_system: false,
-                            image_lines: outgoing_image_lines,
-                            image_path: outgoing_image_path,
-                            status: Some(MessageStatus::Sending),
-                            timestamp_ms: local_ts_ms,
-                            reactions: Vec::new(),
-                            mention_ranges,
-                            style_ranges: Vec::new(),
-                            body_raw: if wire_mentions.is_empty() {
-                                None
-                            } else {
-                                Some(wire_body.clone())
-                            },
-                            mentions: wire_mentions
-                                .iter()
-                                .map(|(start, uuid)| Mention {
-                                    start: *start,
-                                    length: 1,
-                                    uuid: uuid.clone(),
-                                })
-                                .collect(),
-                            quote,
-                            is_edited: false,
-                            is_deleted: false,
-                            is_pinned: false,
-                            sender_id: self.account.clone(),
-                            expires_in_seconds: out_expires,
-                            expiration_start_ms: out_expiry_start,
-                            poll_data: None,
-                            poll_votes: Vec::new(),
-                            preview: None,
-                            preview_image_lines: None,
-                            preview_image_path: None,
-                        });
-                        if out_expires > 0 {
-                            self.expiring_msg_count += 1;
-                        }
-                    }
-                    self.db_warn_visible(
-                        self.db.insert_message_full(
-                            &conv_id,
-                            "you",
-                            &now.to_rfc3339(),
-                            &display_body,
-                            false,
-                            Some(MessageStatus::Sending),
-                            local_ts_ms,
-                            &self.account,
-                            quote_author.as_deref(),
-                            quote_body.as_deref(),
-                            quote_timestamp,
-                            out_expires,
-                            out_expiry_start,
-                        ),
-                        "insert_message",
+                    let outgoing_msg = DisplayMessage {
+                        sender: "you".to_string(),
+                        timestamp: now,
+                        body: display_body.clone(),
+                        is_system: false,
+                        image_lines: outgoing_image_lines,
+                        image_path: outgoing_image_path,
+                        status: Some(MessageStatus::Sending),
+                        timestamp_ms: local_ts_ms,
+                        reactions: Vec::new(),
+                        mention_ranges,
+                        style_ranges: Vec::new(),
+                        body_raw: if wire_mentions.is_empty() {
+                            None
+                        } else {
+                            Some(wire_body.clone())
+                        },
+                        mentions: wire_mentions
+                            .iter()
+                            .map(|(start, uuid)| Mention {
+                                start: *start,
+                                length: 1,
+                                uuid: uuid.clone(),
+                            })
+                            .collect(),
+                        quote,
+                        is_edited: false,
+                        is_deleted: false,
+                        is_pinned: false,
+                        sender_id: self.account.clone(),
+                        expires_in_seconds: out_expires,
+                        expiration_start_ms: out_expiry_start,
+                        poll_data: None,
+                        poll_votes: Vec::new(),
+                        preview: None,
+                        preview_image_lines: None,
+                        preview_image_path: None,
+                    };
+                    self.on_message_added(
+                        &conv_id,
+                        outgoing_msg,
+                        WireQuote {
+                            author: quote_author.clone(),
+                            body: quote_body.clone(),
+                            timestamp: quote_timestamp,
+                        },
+                        false,
                     );
                     self.scroll_offset = 0;
                     self.focused_msg_index = None;
                     self.reply_target = None;
-                    if self.store.move_conversation_to_top(&conv_id) && self.sidebar_filter_active {
-                        self.refresh_sidebar_filter();
-                    }
                     return Some(SendRequest::Message {
                         recipient: conv_id,
                         body: wire_body,
@@ -6173,7 +6306,7 @@ impl App {
                 }
             }
             InputAction::Settings => {
-                self.show_settings = true;
+                self.open_overlay(OverlayKind::Settings);
                 self.settings_index = 0;
                 self.settings_mouse_snapshot = self.mouse_enabled;
             }
@@ -6183,9 +6316,10 @@ impl App {
             InputAction::Search(query) => {
                 self.search
                     .open(query, self.active_conversation.as_deref(), &self.db);
+                self.open_overlay(OverlayKind::Search);
             }
             InputAction::Contacts => {
-                self.contacts_overlay.show = true;
+                self.open_overlay(OverlayKind::Contacts);
                 self.contacts_overlay.index = 0;
                 self.contacts_overlay.filter.clear();
                 self.refresh_contacts_filter();
@@ -6193,9 +6327,10 @@ impl App {
             InputAction::Emoji(query) => {
                 let filter = if query.is_empty() { None } else { Some(query) };
                 self.emoji_picker.open(EmojiPickerSource::Input, filter);
+                self.open_overlay(OverlayKind::EmojiPicker);
             }
             InputAction::Theme => {
-                self.theme_picker.show = true;
+                self.open_overlay(OverlayKind::ThemePicker);
                 self.theme_picker.index = self
                     .theme_picker
                     .available_themes
@@ -6204,6 +6339,7 @@ impl App {
                     .unwrap_or(0);
             }
             InputAction::Group => {
+                self.open_overlay(OverlayKind::GroupMenu);
                 self.group_menu.state = Some(GroupMenuState::Menu);
                 self.group_menu.index = 0;
                 self.group_menu.filter.clear();
@@ -6256,7 +6392,7 @@ impl App {
                             })
                             .unwrap_or_default();
                     }
-                    self.verify.show = true;
+                    self.open_overlay(OverlayKind::Verify);
                     self.verify.index = 0;
                     // Request fresh identity data
                     return Some(SendRequest::ListIdentities);
@@ -6265,19 +6401,19 @@ impl App {
                 }
             }
             InputAction::Profile => {
-                self.profile.show = true;
+                self.open_overlay(OverlayKind::Profile);
                 self.profile.index = 0;
                 self.profile.editing = false;
             }
             InputAction::About => {
-                self.show_about = true;
+                self.open_overlay(OverlayKind::About);
             }
             InputAction::Keybindings => {
-                self.keybindings_overlay.show = true;
+                self.open_overlay(OverlayKind::Keybindings);
                 self.keybindings_overlay.index = 0;
             }
             InputAction::Help => {
-                self.show_help = true;
+                self.open_overlay(OverlayKind::Help);
             }
             InputAction::SetDisappearing(duration_str) => {
                 match input::parse_duration_to_seconds(&duration_str) {
@@ -6346,53 +6482,35 @@ impl App {
 
                     // Optimistic local message
                     let poll_data_for_db = poll_data.clone();
-                    if let Some(conv) = self.store.conversations.get_mut(&conv_id) {
-                        conv.messages.push(DisplayMessage {
-                            sender: "you".to_string(),
-                            timestamp: now,
-                            body: format!("\u{1F4CA} {question}"),
-                            is_system: false,
-                            image_lines: None,
-                            image_path: None,
-                            status: Some(MessageStatus::Sending),
-                            timestamp_ms: local_ts_ms,
-                            reactions: Vec::new(),
-                            mention_ranges: Vec::new(),
-                            style_ranges: Vec::new(),
-                            body_raw: None,
-                            mentions: Vec::new(),
-                            quote: None,
-                            is_edited: false,
-                            is_deleted: false,
-                            is_pinned: false,
-                            sender_id: self.account.clone(),
-                            expires_in_seconds: 0,
-                            expiration_start_ms: 0,
-                            poll_data: Some(poll_data),
-                            poll_votes: Vec::new(),
-                            preview: None,
-                            preview_image_lines: None,
-                            preview_image_path: None,
-                        });
-                    }
-                    self.db_warn_visible(
-                        self.db.insert_message_full(
-                            &conv_id,
-                            "you",
-                            &now.to_rfc3339(),
-                            &format!("\u{1F4CA} {question}"),
-                            false,
-                            Some(MessageStatus::Sending),
-                            local_ts_ms,
-                            &self.account.clone(),
-                            None,
-                            None,
-                            None,
-                            0,
-                            0,
-                        ),
-                        "insert_poll_msg",
-                    );
+                    let body = format!("\u{1F4CA} {question}");
+                    let poll_msg = DisplayMessage {
+                        sender: "you".to_string(),
+                        timestamp: now,
+                        body,
+                        is_system: false,
+                        image_lines: None,
+                        image_path: None,
+                        status: Some(MessageStatus::Sending),
+                        timestamp_ms: local_ts_ms,
+                        reactions: Vec::new(),
+                        mention_ranges: Vec::new(),
+                        style_ranges: Vec::new(),
+                        body_raw: None,
+                        mentions: Vec::new(),
+                        quote: None,
+                        is_edited: false,
+                        is_deleted: false,
+                        is_pinned: false,
+                        sender_id: self.account.clone(),
+                        expires_in_seconds: 0,
+                        expiration_start_ms: 0,
+                        poll_data: Some(poll_data),
+                        poll_votes: Vec::new(),
+                        preview: None,
+                        preview_image_lines: None,
+                        preview_image_path: None,
+                    };
+                    self.on_message_added(&conv_id, poll_msg, WireQuote::default(), false);
                     self.db_warn_visible(
                         self.db
                             .upsert_poll_data(&conv_id, local_ts_ms, &poll_data_for_db),
@@ -6443,7 +6561,7 @@ impl App {
             }
 
             if !candidates.is_empty() {
-                self.autocomplete.visible = true;
+                self.try_open_overlay(OverlayKind::Autocomplete);
                 self.autocomplete.mode = AutocompleteMode::Command;
                 self.autocomplete.command_candidates = candidates;
                 if self.autocomplete.index >= self.autocomplete.command_candidates.len() {
@@ -6511,7 +6629,7 @@ impl App {
             candidates.sort_by_key(|a| a.0.to_lowercase());
 
             if !candidates.is_empty() {
-                self.autocomplete.visible = true;
+                self.try_open_overlay(OverlayKind::Autocomplete);
                 self.autocomplete.mode = AutocompleteMode::Join;
                 self.autocomplete.join_candidates = candidates;
                 if self.autocomplete.index >= self.autocomplete.join_candidates.len() {
@@ -6522,66 +6640,68 @@ impl App {
         }
 
         // Try @mention autocomplete
-        if let Some(ref conv_id) = self.active_conversation {
-            if let Some(conv) = self.store.conversations.get(conv_id) {
-                if let Some(trigger_pos) = self.find_mention_trigger() {
-                    let after_at = &self.input_buffer[trigger_pos + 1..self.input_cursor];
-                    let filter_lower = after_at.to_lowercase();
+        if let Some(ref conv_id) = self.active_conversation
+            && let Some(conv) = self.store.conversations.get(conv_id)
+            && let Some(trigger_pos) = self.find_mention_trigger()
+        {
+            let after_at = &self.input_buffer[trigger_pos + 1..self.input_cursor];
+            let filter_lower = after_at.to_lowercase();
 
-                    let mut candidates: Vec<(String, String, Option<String>)> = Vec::new();
-                    if conv.is_group {
-                        // Group: offer all group members
-                        if let Some(group) = self.store.groups.get(conv_id) {
-                            for member_phone in &group.members {
-                                let name = self
-                                    .store
-                                    .contact_names
-                                    .get(member_phone)
-                                    .cloned()
-                                    .unwrap_or_else(|| member_phone.clone());
-                                let uuid = self.store.number_to_uuid.get(member_phone).cloned();
-                                if filter_lower.is_empty()
-                                    || name.to_lowercase().contains(&filter_lower)
-                                    || member_phone.contains(&filter_lower)
-                                {
-                                    candidates.push((member_phone.clone(), name, uuid));
-                                }
-                            }
-                        }
-                    } else {
-                        // 1:1 chat: offer the contact as a mention candidate
+            let mut candidates: Vec<(String, String, Option<String>)> = Vec::new();
+            if conv.is_group {
+                // Group: offer all group members
+                if let Some(group) = self.store.groups.get(conv_id) {
+                    for member_phone in &group.members {
                         let name = self
                             .store
                             .contact_names
-                            .get(conv_id)
+                            .get(member_phone)
                             .cloned()
-                            .unwrap_or_else(|| conv_id.clone());
-                        let uuid = self.store.number_to_uuid.get(conv_id).cloned();
+                            .unwrap_or_else(|| member_phone.clone());
+                        let uuid = self.store.number_to_uuid.get(member_phone).cloned();
                         if filter_lower.is_empty()
                             || name.to_lowercase().contains(&filter_lower)
-                            || conv_id.contains(&filter_lower)
+                            || member_phone.contains(&filter_lower)
                         {
-                            candidates.push((conv_id.clone(), name, uuid));
+                            candidates.push((member_phone.clone(), name, uuid));
                         }
-                    }
-                    candidates.sort_by_key(|a| a.1.to_lowercase());
-
-                    if !candidates.is_empty() {
-                        self.autocomplete.visible = true;
-                        self.autocomplete.mode = AutocompleteMode::Mention;
-                        self.autocomplete.mention_candidates = candidates;
-                        self.autocomplete.mention_trigger_pos = trigger_pos;
-                        if self.autocomplete.index >= self.autocomplete.mention_candidates.len() {
-                            self.autocomplete.index = 0;
-                        }
-                        return;
                     }
                 }
+            } else {
+                // 1:1 chat: offer the contact as a mention candidate
+                let name = self
+                    .store
+                    .contact_names
+                    .get(conv_id)
+                    .cloned()
+                    .unwrap_or_else(|| conv_id.clone());
+                let uuid = self.store.number_to_uuid.get(conv_id).cloned();
+                if filter_lower.is_empty()
+                    || name.to_lowercase().contains(&filter_lower)
+                    || conv_id.contains(&filter_lower)
+                {
+                    candidates.push((conv_id.clone(), name, uuid));
+                }
+            }
+            candidates.sort_by_key(|a| a.1.to_lowercase());
+
+            if !candidates.is_empty() {
+                self.try_open_overlay(OverlayKind::Autocomplete);
+                self.autocomplete.mode = AutocompleteMode::Mention;
+                self.autocomplete.mention_candidates = candidates;
+                self.autocomplete.mention_trigger_pos = trigger_pos;
+                if self.autocomplete.index >= self.autocomplete.mention_candidates.len() {
+                    self.autocomplete.index = 0;
+                }
+                return;
             }
         }
 
         // No autocomplete match
         self.autocomplete.clear();
+        if self.is_overlay(OverlayKind::Autocomplete) {
+            self.close_overlay();
+        }
     }
 
     /// Find the byte position of the `@` trigger for mention autocomplete.
@@ -6906,7 +7026,7 @@ impl App {
                         self.input_buffer = format!("{} ", cmd.name);
                     }
                     self.input_cursor = self.input_buffer.len();
-                    self.autocomplete.visible = false;
+                    self.close_overlay();
                     self.autocomplete.command_candidates.clear();
                     self.autocomplete.index = 0;
                 }
@@ -6926,7 +7046,7 @@ impl App {
                     self.input_cursor = self.autocomplete.mention_trigger_pos + replacement.len();
                     // Record for outgoing mention
                     self.autocomplete.pending_mentions.push((name, uuid));
-                    self.autocomplete.visible = false;
+                    self.close_overlay();
                     self.autocomplete.mention_candidates.clear();
                     self.autocomplete.index = 0;
                 }
@@ -6940,7 +7060,7 @@ impl App {
                 {
                     self.input_buffer = format!("/join {value}");
                     self.input_cursor = self.input_buffer.len();
-                    self.autocomplete.visible = false;
+                    self.close_overlay();
                     self.autocomplete.join_candidates.clear();
                     self.autocomplete.index = 0;
                 }
@@ -7094,15 +7214,30 @@ impl App {
                 let prefix = if conv.is_group { "#" } else { "" };
                 self.status_message = format!("connected | {}{}", prefix, conv.name);
             }
-            // Show message request overlay for unaccepted conversations
-            self.show_message_request = self
+            // Show message request overlay for unaccepted conversations.
+            //
+            // The pre-refactor model set `show_message_request` as an independent
+            // bool that coexisted with other overlays; dispatch priority decided
+            // which was visible. Naively calling `open_overlay(MessageRequest)`
+            // here would clobber any higher-priority App-owned overlay the user
+            // had open (e.g. closing Settings mid-edit when Tab switches to an
+            // unaccepted conversation). Only claim the slot when no other
+            // App-owned overlay is active.
+            let should_show = self
                 .active_conversation
                 .as_ref()
                 .and_then(|id| self.store.conversations.get(id))
                 .is_some_and(|c| !c.accepted);
+            if should_show {
+                self.try_open_overlay(OverlayKind::MessageRequest);
+            } else if self.is_overlay(OverlayKind::MessageRequest) {
+                self.close_overlay();
+            }
         } else {
             self.status_message = "connected | no conversation selected".to_string();
-            self.show_message_request = false;
+            if self.is_overlay(OverlayKind::MessageRequest) {
+                self.close_overlay();
+            }
         }
     }
 
@@ -7212,12 +7347,12 @@ impl App {
 
     /// Clear the clipboard if auto-clear timer has expired.
     pub fn check_clipboard_clear(&mut self) {
-        if let Some(set_at) = self.notifications.clipboard_set_at {
-            if set_at.elapsed().as_secs() >= self.notifications.clipboard_clear_seconds {
-                self.notifications.clipboard_set_at = None;
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    let _ = clipboard.set_text("");
-                }
+        if let Some(set_at) = self.notifications.clipboard_set_at
+            && set_at.elapsed().as_secs() >= self.notifications.clipboard_clear_seconds
+        {
+            self.notifications.clipboard_set_at = None;
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text("");
             }
         }
     }
@@ -7238,28 +7373,11 @@ impl App {
 
     // --- Mouse support ---
 
-    /// Returns true if any overlay is currently visible (mouse events should be ignored).
+    /// Returns true if any overlay is currently visible.
+    ///
+    /// Derived from `active_overlay` so it can never drift from dispatch.
     pub fn has_overlay(&self) -> bool {
-        self.show_settings
-            || self.show_help
-            || self.contacts_overlay.show
-            || self.search.visible
-            || self.file_picker.visible
-            || self.action_menu.show
-            || self.reactions.show_picker
-            || self.emoji_picker.visible
-            || self.show_delete_confirm
-            || self.group_menu.state.is_some()
-            || self.show_message_request
-            || self.theme_picker.show
-            || self.keybindings_overlay.show
-            || self.settings_profiles.show
-            || self.pin_duration.show
-            || self.poll_vote.show
-            || self.show_about
-            || self.profile.show
-            || self.forward.show
-            || self.autocomplete.visible
+        self.active_overlay().is_some()
     }
 
     /// Handle a mouse event. Returns an optional SendRequest (currently unused but future-proof).
@@ -7312,22 +7430,23 @@ impl App {
         }
 
         // 2. Sidebar click — switch conversation
-        if let Some(inner) = self.mouse_sidebar_inner {
-            if is_in_rect(col, row, inner) {
-                let index = (row - inner.y) as usize;
-                let sidebar_list =
-                    if self.sidebar_filter_active && !self.sidebar_filtered.is_empty() {
-                        &self.sidebar_filtered
-                    } else {
-                        &self.store.conversation_order
-                    };
-                if index < sidebar_list.len() {
-                    let conv_id = sidebar_list[index].clone();
-                    self.clear_sidebar_filter();
-                    self.join_conversation(&conv_id);
-                }
-                return;
+        if let Some(inner) = self.mouse_sidebar_inner
+            && is_in_rect(col, row, inner)
+        {
+            let index = (row - inner.y) as usize;
+            let sidebar_list = if self.is_overlay(OverlayKind::SidebarFilter)
+                && !self.sidebar_filtered.is_empty()
+            {
+                &self.sidebar_filtered
+            } else {
+                &self.store.conversation_order
+            };
+            if index < sidebar_list.len() {
+                let conv_id = sidebar_list[index].clone();
+                self.clear_sidebar_filter();
+                self.join_conversation(&conv_id);
             }
+            return;
         }
 
         // 3. Input area click — position cursor and enter Insert mode
@@ -7523,10 +7642,10 @@ fn extract_file_uri(body: &str) -> Option<String> {
 fn extract_http_url(body: &str) -> Option<String> {
     let mut best: Option<(usize, &str)> = None;
     for scheme in &["https://", "http://"] {
-        if let Some(pos) = body.find(scheme) {
-            if best.is_none() || pos < best.unwrap().0 {
-                best = Some((pos, scheme));
-            }
+        if let Some(pos) = body.find(scheme)
+            && (best.is_none() || pos < best.unwrap().0)
+        {
+            best = Some((pos, scheme));
         }
     }
     let (pos, _) = best?;
@@ -7721,7 +7840,11 @@ impl App {
         );
         bob_reply.status = Some(MessageStatus::Read);
 
-        let bob_thanks = dm("Bob", ts(10, 15), "Thanks! I'll address those. Also the migration is backwards-compatible so no rush on deploy");
+        let bob_thanks = dm(
+            "Bob",
+            ts(10, 15),
+            "Thanks! I'll address those. Also the migration is backwards-compatible so no rush on deploy",
+        );
 
         // Quote reply: Bob quotes the review comment
         let mut bob_followup = dm("Bob", ts(10, 20), "Fixed those error handling bits, PTAL");
@@ -8357,7 +8480,8 @@ mod tests {
         app.input_buffer = input.to_string();
         app.update_autocomplete();
         assert_eq!(
-            app.autocomplete.visible, expected_visible,
+            app.is_overlay(OverlayKind::Autocomplete),
+            expected_visible,
             "visibility for {input:?}"
         );
         if let Some(count) = expected_count {
@@ -8411,7 +8535,7 @@ mod tests {
             .insert("+2".to_string(), "Bob".to_string());
         app.input_buffer = "/join ".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.mode, AutocompleteMode::Join);
         assert_eq!(app.autocomplete.join_candidates.len(), 2);
     }
@@ -8429,7 +8553,7 @@ mod tests {
         );
         app.input_buffer = "/join ".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.mode, AutocompleteMode::Join);
         assert_eq!(app.autocomplete.join_candidates.len(), 1);
         assert!(app.autocomplete.join_candidates[0].0.starts_with('#'));
@@ -8445,7 +8569,7 @@ mod tests {
             .insert("+2".to_string(), "Bob".to_string());
         app.input_buffer = "/join al".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.join_candidates.len(), 1);
         assert!(app.autocomplete.join_candidates[0].0.contains("Alice"));
     }
@@ -8460,7 +8584,7 @@ mod tests {
             .insert("+5678".to_string(), "Bob".to_string());
         app.input_buffer = "/join +123".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.join_candidates.len(), 1);
         assert!(app.autocomplete.join_candidates[0].1 == "+1234");
     }
@@ -8472,7 +8596,7 @@ mod tests {
             .insert("+1".to_string(), "Alice".to_string());
         app.input_buffer = "/j ".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.mode, AutocompleteMode::Join);
         assert_eq!(app.autocomplete.join_candidates.len(), 1);
     }
@@ -8484,7 +8608,7 @@ mod tests {
             .insert("+1".to_string(), "Alice".to_string());
         app.input_buffer = "/join zzz".to_string();
         app.update_autocomplete();
-        assert!(!app.autocomplete.visible);
+        assert!(!app.is_overlay(OverlayKind::Autocomplete));
     }
 
     #[rstest]
@@ -8494,11 +8618,11 @@ mod tests {
             .insert("+1".to_string(), "Alice".to_string());
         app.input_buffer = "/join al".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         app.apply_autocomplete();
         assert_eq!(app.input_buffer, "/join +1");
         assert_eq!(app.input_cursor, 8);
-        assert!(!app.autocomplete.visible);
+        assert!(!app.is_overlay(OverlayKind::Autocomplete));
     }
 
     #[rstest]
@@ -8514,7 +8638,7 @@ mod tests {
         );
         app.input_buffer = "/join fam".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         app.apply_autocomplete();
         assert_eq!(app.input_buffer, "/join g1");
         assert_eq!(app.input_cursor, 8);
@@ -8527,7 +8651,7 @@ mod tests {
             .get_or_create_conversation("+9999", "+9999", false, &app.db);
         app.input_buffer = "/join +999".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.join_candidates.len(), 1);
     }
 
@@ -8542,7 +8666,7 @@ mod tests {
             .insert("+1".to_string(), "Alice".to_string());
         app.input_buffer = "/join ".to_string();
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         // Only Alice should appear from contact_names (g1 is skipped as non-phone)
         let contact_entries: Vec<_> = app
             .autocomplete
@@ -9866,7 +9990,7 @@ mod tests {
         app.update_autocomplete();
 
         // Should trigger mention autocomplete in 1:1 with the contact
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.mode, AutocompleteMode::Mention);
         assert_eq!(app.autocomplete.mention_candidates.len(), 1);
         assert_eq!(app.autocomplete.mention_candidates[0].1, "Alice");
@@ -9898,7 +10022,7 @@ mod tests {
         app.input_cursor = 3;
         app.update_autocomplete();
 
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
         assert_eq!(app.autocomplete.mode, AutocompleteMode::Mention);
         assert_eq!(app.autocomplete.mention_candidates.len(), 1);
         assert_eq!(app.autocomplete.mention_candidates[0].1, "Alice");
@@ -9929,7 +10053,7 @@ mod tests {
         app.input_buffer = "Hey @Al".to_string();
         app.input_cursor = 7;
         app.update_autocomplete();
-        assert!(app.autocomplete.visible);
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
 
         app.apply_autocomplete();
         assert_eq!(app.input_buffer, "Hey @Alice ");
@@ -10048,7 +10172,7 @@ mod tests {
     fn attach_no_conversation_shows_error(mut app: App) {
         app.active_conversation = None;
         app.open_file_browser();
-        assert!(!app.file_picker.visible);
+        assert!(!app.is_overlay(OverlayKind::FilePicker));
         assert!(app.status_message.contains("No active conversation"));
     }
 
@@ -10099,7 +10223,7 @@ mod tests {
         app.input_cursor = 13;
         app.handle_input();
 
-        assert!(app.search.visible);
+        assert!(app.is_overlay(OverlayKind::Search));
         assert_eq!(app.search.query, "hello");
         assert!(!app.search.results.is_empty());
         assert_eq!(app.search.results[0].body, "hello world");
@@ -10111,18 +10235,18 @@ mod tests {
         app.input_cursor = 7;
         app.handle_input();
 
-        assert!(!app.search.visible);
+        assert!(!app.is_overlay(OverlayKind::Search));
         assert!(app.status_message.contains("requires"));
     }
 
     #[rstest]
     fn search_overlay_esc_closes(mut app: App) {
-        app.search.visible = true;
+        app.open_overlay(OverlayKind::Search);
         app.search.query = "test".to_string();
 
         app.handle_search_key(KeyCode::Esc);
 
-        assert!(!app.search.visible);
+        assert!(!app.is_overlay(OverlayKind::Search));
         assert!(app.search.query.is_empty());
     }
 
@@ -10154,7 +10278,7 @@ mod tests {
             )
             .unwrap();
 
-        app.search.visible = true;
+        app.open_overlay(OverlayKind::Search);
         app.search.query = "hello".to_string();
         app.search.run(app.active_conversation.as_deref(), &app.db);
         assert_eq!(app.search.results.len(), 1);
@@ -10698,11 +10822,11 @@ mod tests {
     fn accept_key_returns_send_request_and_marks_accepted(mut app: App) {
         app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
         app.active_conversation = Some("+1".to_string());
-        app.show_message_request = true;
+        app.open_overlay(OverlayKind::MessageRequest);
 
         let req = app.handle_message_request_key(KeyCode::Char('a'));
         assert!(app.store.conversations["+1"].accepted);
-        assert!(!app.show_message_request);
+        assert!(!app.is_overlay(OverlayKind::MessageRequest));
         assert!(matches!(
             req,
             Some(SendRequest::MessageRequestResponse { ref response_type, .. })
@@ -10714,13 +10838,13 @@ mod tests {
     fn delete_key_removes_conversation(mut app: App) {
         app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
         app.active_conversation = Some("+1".to_string());
-        app.show_message_request = true;
+        app.open_overlay(OverlayKind::MessageRequest);
 
         let req = app.handle_message_request_key(KeyCode::Char('d'));
         assert!(!app.store.conversations.contains_key("+1"));
         assert!(!app.store.conversation_order.contains(&"+1".to_string()));
         assert!(app.active_conversation.is_none());
-        assert!(!app.show_message_request);
+        assert!(!app.is_overlay(OverlayKind::MessageRequest));
         assert!(matches!(
             req,
             Some(SendRequest::MessageRequestResponse { ref response_type, .. })
@@ -10732,12 +10856,73 @@ mod tests {
     fn esc_closes_message_request_overlay(mut app: App) {
         app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+1")));
         app.active_conversation = Some("+1".to_string());
-        app.show_message_request = true;
+        app.open_overlay(OverlayKind::MessageRequest);
 
         let req = app.handle_message_request_key(KeyCode::Esc);
         assert!(req.is_none());
-        assert!(!app.show_message_request);
+        assert!(!app.is_overlay(OverlayKind::MessageRequest));
         assert!(app.active_conversation.is_none());
+    }
+
+    #[rstest]
+    fn update_status_does_not_clobber_active_app_overlay(mut app: App) {
+        // Regression guard for PR #345: opening MessageRequest during a
+        // conversation switch must not close an already-open App-owned
+        // overlay (e.g. Settings mid-edit). The user would see their
+        // settings state silently vanish.
+        app.handle_signal_event(SignalEvent::MessageReceived(msg_from("+unaccepted")));
+        app.open_overlay(OverlayKind::Settings);
+        app.active_conversation = Some("+unaccepted".to_string());
+
+        // Simulate the conversation switch that triggers update_status.
+        // (update_status is private; calling the public code path via an
+        // explicit switch reaches it.)
+        app.update_status();
+
+        assert_eq!(
+            app.active_overlay(),
+            Some(OverlayKind::Settings),
+            "Settings overlay must not be clobbered by MessageRequest"
+        );
+    }
+
+    #[rstest]
+    fn autocomplete_esc_closes_overlay(mut app: App) {
+        // Regression guard for PR #346: pre-fix, AutocompleteState::clear()
+        // no longer touched visibility, so Esc cleared candidates but left
+        // current_overlay = Some(Autocomplete), trapping subsequent input
+        // in the empty handler.
+        app.mode = InputMode::Insert;
+        app.input_buffer = "/j".to_string();
+        app.input_cursor = 2;
+        app.update_autocomplete();
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
+
+        app.handle_autocomplete_key(KeyCode::Esc);
+        assert!(
+            !app.is_overlay(OverlayKind::Autocomplete),
+            "Esc should close the autocomplete overlay"
+        );
+    }
+
+    #[rstest]
+    fn autocomplete_no_match_closes_overlay(mut app: App) {
+        // Regression guard for PR #346: typing past any candidate match
+        // should drop visibility, not leave the empty overlay open.
+        app.mode = InputMode::Insert;
+        app.input_buffer = "/j".to_string();
+        app.input_cursor = 2;
+        app.update_autocomplete();
+        assert!(app.is_overlay(OverlayKind::Autocomplete));
+
+        // Type a string that matches no command/mention/join.
+        app.input_buffer = "/zzznothingmatches".to_string();
+        app.input_cursor = app.input_buffer.len();
+        app.update_autocomplete();
+        assert!(
+            !app.is_overlay(OverlayKind::Autocomplete),
+            "no-match autocomplete refresh should close the overlay"
+        );
     }
 
     #[rstest]
@@ -10886,7 +11071,7 @@ mod tests {
 
     #[rstest]
     fn mouse_overlay_scroll_navigates_list(mut app: App) {
-        app.show_settings = true;
+        app.open_overlay(OverlayKind::Settings);
         app.settings_index = 0;
         app.mouse_messages_area = Rect::new(0, 0, 80, 20);
         // Scroll down in overlay should navigate settings list (j), not scroll messages
@@ -10961,78 +11146,76 @@ mod tests {
         assert_eq!(app.input_cursor, 5); // byte offset of space after "café"
     }
 
+    /// Toggle an overlay to the requested state. Routes through
+    /// `open_overlay`/`close_overlay` so the test mirrors production
+    /// callers, and special-cases GroupMenu's sub-state field.
+    fn toggle_overlay(app: &mut App, kind: OverlayKind, on: bool) {
+        if on {
+            app.open_overlay(kind);
+        } else if app.is_overlay(kind) {
+            app.close_overlay();
+        }
+        // GroupMenu carries an extra Option<GroupMenuState> sub-state that
+        // historically also encoded visibility. Keep it in sync so tests
+        // exercising group-menu rendering still see Some(Menu) when open.
+        if matches!(kind, OverlayKind::GroupMenu) {
+            app.group_menu.state = if on { Some(GroupMenuState::Menu) } else { None };
+        }
+    }
+
+    const ALL_OVERLAYS: &[OverlayKind] = &[
+        OverlayKind::SidebarFilter,
+        OverlayKind::PollVote,
+        OverlayKind::PinDuration,
+        OverlayKind::ActionMenu,
+        OverlayKind::DeleteConfirm,
+        OverlayKind::FilePicker,
+        OverlayKind::EmojiPicker,
+        OverlayKind::ReactionPicker,
+        OverlayKind::MessageRequest,
+        OverlayKind::GroupMenu,
+        OverlayKind::About,
+        OverlayKind::Profile,
+        OverlayKind::Help,
+        OverlayKind::Verify,
+        OverlayKind::Forward,
+        OverlayKind::Contacts,
+        OverlayKind::Search,
+        OverlayKind::SettingsProfiles,
+        OverlayKind::ThemePicker,
+        OverlayKind::Keybindings,
+        OverlayKind::Customize,
+        OverlayKind::Settings,
+        OverlayKind::Autocomplete,
+    ];
+
     #[rstest]
-    fn has_overlay_detects_all_overlays(mut app: App) {
+    fn active_overlay_covers_every_variant(mut app: App) {
+        // Tripwire: `ALL_OVERLAYS` is a hand-maintained slice because Rust has
+        // no stable way to enumerate enum variants. Adding a variant without
+        // extending this slice would silently skip it; the length check turns
+        // that into a loud test failure.
+        assert_eq!(
+            ALL_OVERLAYS.len(),
+            23,
+            "ALL_OVERLAYS is out of sync with OverlayKind - update when adding or removing a variant"
+        );
+
+        assert_eq!(app.active_overlay(), None);
         assert!(!app.has_overlay());
 
-        app.show_settings = true;
-        assert!(app.has_overlay());
-        app.show_settings = false;
+        for &kind in ALL_OVERLAYS {
+            toggle_overlay(&mut app, kind, true);
+            assert_eq!(
+                app.active_overlay(),
+                Some(kind),
+                "active_overlay did not match after enabling {kind:?}"
+            );
+            assert!(app.has_overlay(), "has_overlay returned false for {kind:?}");
+            toggle_overlay(&mut app, kind, false);
+        }
 
-        app.show_help = true;
-        assert!(app.has_overlay());
-        app.show_help = false;
-
-        app.contacts_overlay.show = true;
-        assert!(app.has_overlay());
-        app.contacts_overlay.show = false;
-
-        app.search.visible = true;
-        assert!(app.has_overlay());
-        app.search.visible = false;
-
-        app.file_picker.visible = true;
-        assert!(app.has_overlay());
-        app.file_picker.visible = false;
-
-        app.action_menu.show = true;
-        assert!(app.has_overlay());
-        app.action_menu.show = false;
-
-        app.reactions.show_picker = true;
-        assert!(app.has_overlay());
-        app.reactions.show_picker = false;
-
-        app.emoji_picker.visible = true;
-        assert!(app.has_overlay());
-        app.emoji_picker.visible = false;
-
-        app.show_delete_confirm = true;
-        assert!(app.has_overlay());
-        app.show_delete_confirm = false;
-
-        app.group_menu.state = Some(GroupMenuState::Menu);
-        assert!(app.has_overlay());
-        app.group_menu.state = None;
-
-        app.show_message_request = true;
-        assert!(app.has_overlay());
-        app.show_message_request = false;
-
-        app.autocomplete.visible = true;
-        assert!(app.has_overlay());
-        app.autocomplete.visible = false;
-
-        app.pin_duration.show = true;
-        assert!(app.has_overlay());
-        app.pin_duration.show = false;
-
-        app.poll_vote.show = true;
-        assert!(app.has_overlay());
-        app.poll_vote.show = false;
-
-        app.show_about = true;
-        assert!(app.has_overlay());
-        app.show_about = false;
-
-        app.profile.show = true;
-        assert!(app.has_overlay());
-        app.profile.show = false;
-
-        app.forward.show = true;
-        assert!(app.has_overlay());
-        app.forward.show = false;
-
+        assert_eq!(app.active_overlay(), None);
         assert!(!app.has_overlay());
     }
 
@@ -11068,12 +11251,12 @@ mod tests {
         // First d sets pending
         app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('d'));
         assert_eq!(app.pending_normal_key, Some('d'));
-        assert!(!app.show_delete_confirm);
+        assert!(!app.is_overlay(OverlayKind::DeleteConfirm));
 
         // Second d triggers delete confirm
         app.handle_normal_key(KeyModifiers::NONE, KeyCode::Char('d'));
         assert_eq!(app.pending_normal_key, None);
-        assert!(app.show_delete_confirm);
+        assert!(app.is_overlay(OverlayKind::DeleteConfirm));
     }
 
     #[rstest]
@@ -11229,10 +11412,11 @@ mod tests {
         }];
         app.handle_signal_event(SignalEvent::MessageReceived(msg));
         let conv = &app.store.conversations["+1"];
-        assert!(conv
-            .messages
-            .iter()
-            .any(|m| m.body.contains("[image: photo.jpg]")));
+        assert!(
+            conv.messages
+                .iter()
+                .any(|m| m.body.contains("[image: photo.jpg]"))
+        );
     }
 
     #[rstest]
@@ -11246,10 +11430,11 @@ mod tests {
         }];
         app.handle_signal_event(SignalEvent::MessageReceived(msg));
         let conv = &app.store.conversations["+1"];
-        assert!(conv
-            .messages
-            .iter()
-            .any(|m| m.body.contains("[attachment: doc.pdf]")));
+        assert!(
+            conv.messages
+                .iter()
+                .any(|m| m.body.contains("[attachment: doc.pdf]"))
+        );
     }
 
     #[rstest]
@@ -11280,10 +11465,11 @@ mod tests {
         }];
         app.handle_signal_event(SignalEvent::MessageReceived(msg));
         let conv = &app.store.conversations["+1"];
-        assert!(conv
-            .messages
-            .iter()
-            .any(|m| m.body.contains("[attachment: audio/ogg]")));
+        assert!(
+            conv.messages
+                .iter()
+                .any(|m| m.body.contains("[attachment: audio/ogg]"))
+        );
     }
 
     // --- Bell / notification tests ---

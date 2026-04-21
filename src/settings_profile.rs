@@ -1,3 +1,10 @@
+//! Named settings profiles.
+//!
+//! A [`SettingsProfile`] bundles display preferences (image mode, receipts,
+//! theme, etc.) so users can swap between configurations. Built-in profiles
+//! ship with the binary; user-defined profiles live in
+//! `~/.config/siggy/profiles/*.toml`.
+
 use serde::{Deserialize, Serialize};
 
 use crate::app::App;
@@ -195,13 +202,12 @@ pub fn delete_custom_profile(name: &str) -> Result<(), String> {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(p) = toml::from_str::<SettingsProfile>(&contents) {
-                if p.name == name {
-                    std::fs::remove_file(&path).map_err(|e| format!("delete: {e}"))?;
-                    return Ok(());
-                }
-            }
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(p) = toml::from_str::<SettingsProfile>(&contents)
+            && p.name == name
+        {
+            std::fs::remove_file(&path).map_err(|e| format!("delete: {e}"))?;
+            return Ok(());
         }
     }
     Err(format!("profile '{name}' not found"))

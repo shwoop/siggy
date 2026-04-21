@@ -1,3 +1,10 @@
+//! Slash-command parsing.
+//!
+//! Translates the user's typed input buffer into an [`InputAction`] enum
+//! consumed by the event loop. Slash commands (`/join`, `/part`, `/quit`,
+//! `/sidebar`, `/help`, ...) live in [`COMMANDS`] alongside their
+//! autocomplete metadata.
+
 /// Metadata for a slash command (used for autocomplete + help)
 pub struct CommandInfo {
     pub name: &'static str,
@@ -444,12 +451,11 @@ pub fn replace_shortcodes(input: &str) -> String {
                 && candidate
                     .chars()
                     .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '+')
+                && let Some(emoji) = emojis::get_by_shortcode(candidate)
             {
-                if let Some(emoji) = emojis::get_by_shortcode(candidate) {
-                    result.push_str(emoji.as_str());
-                    rest = &after_colon[end + 1..];
-                    continue;
-                }
+                result.push_str(emoji.as_str());
+                rest = &after_colon[end + 1..];
+                continue;
             }
             // Not a valid shortcode — emit the colon and continue
             result.push(':');
